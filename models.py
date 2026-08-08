@@ -145,6 +145,14 @@ class RetrievalAction(BaseModel):
     category: Optional[str] = None
     days: Optional[int] = None
     paper_id: Optional[str] = None
+    paper_title: Optional[str] = Field(
+        default=None,
+        description=(
+            "PAPER_LOOKUP / PAPER_QA. Natural-language paper name/title, when the "
+            "user names a paper without giving a strict alphanumeric arXiv ID "
+            "(e.g. '1706.03762'). Populate this instead of paper_id in that case."
+        ),
+    )
     citation_direction: Optional[Literal["incoming", "outgoing"]] = None
     paper_ids: Optional[list[str]] = Field(
         default=None,
@@ -177,7 +185,15 @@ class ClassifyResult(BaseModel):
     author_name: Optional[str] = None
     category: Optional[str] = None          # ArXiv category code, e.g. cs.CL
     days: Optional[int] = None              # lookback window for RECENT_DIGEST
-    paper_id: Optional[str] = None          # ArXiv id, or the paper's title if no id given
+    paper_id: Optional[str] = None          # strict alphanumeric ArXiv id only, e.g. "1706.03762"
+    paper_title: Optional[str] = Field(
+        default=None,
+        description=(
+            "PAPER_LOOKUP / PAPER_QA. Natural-language paper name/title, when the "
+            "user names a paper without giving a strict alphanumeric arXiv ID. "
+            "Populate this instead of paper_id in that case."
+        ),
+    )
     citation_direction: Optional[Literal["incoming", "outgoing"]] = Field(
         default=None,
         description="incoming = papers that cite this one, outgoing = this paper's references",

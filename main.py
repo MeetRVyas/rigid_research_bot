@@ -64,6 +64,35 @@ TOOL_REGISTRY = {
     "search_semantic_scholar": search_semantic_scholar,
 }
 
+# Secondary fallback for `_rewrite_pdf_query` when the LLM rewrite call
+# itself fails — strips common conversational wrappers so vector search
+# against a paper's full text isn't polluted with e.g. "Hi can you tell me
+# what the paper says about..." Ordered so greetings/lead-ins are stripped
+# before trailing "?" punctuation.
+_PDF_QUERY_FILLER_PATTERNS = [
+    re.compile(r"^\s*(hi|hello|hey)[,!.\s]+", re.IGNORECASE),
+    re.compile(r"^\s*(so|well|ok(ay)?)[,!.\s]+", re.IGNORECASE),
+    re.compile(r"\b(can|could|would)\s+you\s+(please\s+)?(tell|let)\s+me\s+", re.IGNORECASE),
+    re.compile(r"\b(can|could|would)\s+you\s+(please\s+)?(explain|describe|summarize|find|search(\s+for)?|look\s*up)\s+", re.IGNORECASE),
+    re.compile(r"\bi\s+(want|would like|need)\s+to\s+know\s+(about\s+)?", re.IGNORECASE),
+    re.compile(r"\bwhat\s+does\s+(the|this)\s+paper\s+say\s+about\s+", re.IGNORECASE),
+    re.compile(r"\btell\s+me\s+about\s+", re.IGNORECASE),
+    re.compile(r"\bplease\s+", re.IGNORECASE),
+    re.compile(r"[?!]+\s*$"),
+]
+
+
+def _strip_conversational_filler(text: str) -> str:
+    """Best-effort regex cleanup of conversational wrapping around a
+    question. Falls back to the original text unchanged if stripping would
+    leave nothing behind, so the caller never ends up searching on ''."""
+    cleaned = text
+    for pattern in _PDF_QUERY_FILLER_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = cleaned.strip(" ,.!?")
+    return cleaned if cleaned else text
+
+
 BYPASS_INTENTS = {
     Intent.AUTHOR_LOOKUP.value,
     Intent.RECENT_DIGEST.value,
@@ -126,17 +155,46 @@ class PaperRetriever:
     def __init__(self, tool_registry: Dict[str, Any]):
         self._tool_registry = tool_registry
 
+    # Tools whose failure/emptiness is worth retrying against a different
+    # provider before giving up on the retrieval step entirely.
+    _FALLBACK_CHAIN = {"search_semantic_scholar": "search_papers"}
+
     async def retrieve(self, tool_name: str, tool_args: Dict[str, Any]) -> List[Document]:
         tool_fn = self._tool_registry.get(tool_name)
         if not tool_fn:
             return []
+
+        raw_results, failed = await self._call_tool(tool_fn, tool_name, tool_args)
+        effective_tool = tool_name
+
+        # Chain-of-search: a Semantic Scholar rate limit (429) or an empty
+        # result set shouldn't dead-end the retrieval — arXiv's own search
+        # API covers most of the same academic-paper ground for a plain
+        # keyword query, so retry there before surfacing "no results".
+        fallback_name = self._FALLBACK_CHAIN.get(tool_name)
+        if fallback_name and (failed or not raw_results):
+            fallback_fn = self._tool_registry.get(fallback_name)
+            if fallback_fn:
+                fallback_args: Dict[str, Any] = {"query": tool_args.get("query", "")}
+                if "max_results" in tool_args:
+                    fallback_args["max_results"] = tool_args["max_results"]
+                fb_raw, fb_failed = await self._call_tool(fallback_fn, fallback_name, fallback_args)
+                if not fb_failed and fb_raw:
+                    raw_results, effective_tool = fb_raw, fallback_name
+
+        return self._normalize(raw_results, effective_tool)
+
+    @staticmethod
+    async def _call_tool(tool_fn: Any, tool_name: str, tool_args: Dict[str, Any]) -> Tuple[Any, bool]:
+        """Runs a sync tool in a background thread. Never raises — returns
+        (result, failed) so callers can branch on a failure vs. a genuinely
+        empty-but-successful result without a second try/except."""
         try:
             # Dispatch synchronous tools into background threads
-            raw_results = await asyncio.to_thread(tool_fn, **tool_args)
+            return await asyncio.to_thread(tool_fn, **tool_args), False
         except Exception as e:
             error_logger.error(f"tool call {tool_name}({tool_args}) failed: {e}", exc_info=True)
-            return []
-        return self._normalize(raw_results, tool_name)
+            return None, True
 
     @staticmethod
     def _normalize(raw: Any, tool_name: str) -> List[Document]:
@@ -479,8 +537,8 @@ class CRAG_Service:
             "Your task is to classify the user's PRIMARY intent into exactly ONE of the categories below, and extract relevant slots.\n\n"
             
             "CATEGORIES:\n"
-            "- PAPER_LOOKUP: Use when the user asks for metadata (abstract, authors, publication date, PDF link) of a SPECIFIC paper.\n"
-            "- PAPER_QA: Use when the user asks about the internal content, methodology, results, or wants to COMPARE specific papers. (Requires full-text). Extract slots: `paper_ids` (list of arXiv IDs, or [\"all\"] for session papers) and `query` (focused search string to find inside the text).\n"
+            "- PAPER_LOOKUP: Use when the user asks for metadata (abstract, authors, publication date, PDF link) of a SPECIFIC paper. Extract `paper_id` if a strict alphanumeric arXiv ID is given (e.g., '1706.03762'); otherwise extract the paper's natural-language name into `paper_title`.\n"
+            "- PAPER_QA: Use when the user asks about the internal content, methodology, results, or wants to COMPARE specific papers. (Requires full-text). Extract slots: `paper_ids` (list of arXiv IDs, or [\"all\"] for session papers), `paper_title` (if the user names the paper in natural language instead of giving an ID), and `query` (focused search string to find inside the text).\n"
             "- AUTHOR_LOOKUP: Use when the user specifically searches for publications by a named author.\n"
             "- RECENT_DIGEST: Use when the user asks for new, recent, or latest developments within a category/timeframe.\n"
             "- CITATION_GRAPH: Use when the user asks about references (what this paper cites) or forward citations (what cites this paper).\n"
@@ -494,7 +552,8 @@ class CRAG_Service:
             "CRITICAL RULES:\n"
             "1. NEVER use OPEN_ENDED if the user names a specific paper, author, or asks for recent papers.\n"
             "2. ALWAYS use PAPER_QA if the user asks to compare specific papers.\n"
-            "3. Extract all available slots accurately based strictly on the user's exact wording."
+            "3. Extract all available slots accurately based strictly on the user's exact wording.\n"
+            "4. If the user provides a natural language name or title of a paper, extract it to `paper_title`. ONLY populate `paper_id` if the user provides a strict alphanumeric ID (e.g., '1706.03762')."
             ),
             ("human", "Conversation so far:\n{history}\n\nQuestion: {question}"),
         ])
@@ -508,7 +567,8 @@ class CRAG_Service:
         def _slots(obj) -> Dict[str, Any]:
             return {
                 "author_name": obj.author_name, "category": obj.category, "days": obj.days,
-                "paper_id": obj.paper_id, "citation_direction": obj.citation_direction,
+                "paper_id": obj.paper_id, "paper_title": obj.paper_title,
+                "citation_direction": obj.citation_direction,
                 "paper_ids": obj.paper_ids, "query": obj.query,
             }
 
@@ -596,8 +656,15 @@ CONFIDENCE RUBRIC:
             tool_name = "get_paper_citations" if (action.get("citation_direction") or "incoming") == "incoming" else "get_related_papers"
             return {"tool_name": tool_name, "tool_args": {"paper_id": action.get("paper_id")}}
         if intent == Intent.PAPER_LOOKUP.value:
-            tool_name = "get_paper_pdf_url" if any(kw in state["question"].lower() for kw in ("pdf", "download")) else "get_paper_details"
-            return {"tool_name": tool_name, "tool_args": {"paper_id": action.get("paper_id")}}
+            if action.get("paper_title"):
+                return {"tool_name": "search_title", "tool_args": {"query": action["paper_title"]}}
+            if action.get("paper_id"):
+                tool_name = "get_paper_pdf_url" if any(kw in state["question"].lower() for kw in ("pdf", "download")) else "get_paper_details"
+                return {"tool_name": tool_name, "tool_args": {"paper_id": action["paper_id"]}}
+            # Neither slot populated (e.g. classify() failed and fell back to a
+            # bare ClassifyResult) — keep the old, safe-but-empty behavior
+            # rather than guessing.
+            return {"tool_name": "get_paper_details", "tool_args": {"paper_id": None}}
         if intent == Intent.PAPER_QA.value:
             paper_ids = action.get("paper_ids") or ([action["paper_id"]] if action.get("paper_id") else ["all"])
             query = action.get("query") or await self._rewrite_pdf_query(state)
@@ -714,7 +781,7 @@ CONFIDENCE RUBRIC:
             return (await chain.ainvoke({"question": state["question"]})).strip()
         except Exception as e:
             error_logger.error(f"Error rewriting pdf query: {e}", exc_info=True)
-            return state["question"]
+            return _strip_conversational_filler(state["question"])
 
 
 # ======================================================================
