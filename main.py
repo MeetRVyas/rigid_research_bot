@@ -78,6 +78,16 @@ warnings.filterwarnings("ignore")
 # This forces libraries to only print CRITICAL issues, hiding standard warnings/errors
 logging.getLogger().setLevel(logging.CRITICAL)
 
+# Graceful Error Logging Setup
+os.makedirs("logs", exist_ok=True)
+error_logger = logging.getLogger("crag_error_logger")
+error_logger.setLevel(logging.ERROR)
+error_logger.propagate = False
+if not error_logger.handlers:
+    file_handler = logging.FileHandler(os.path.join("logs", "error.log"))
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    error_logger.addHandler(file_handler)
+
 # ======================================================================
 # Graph state
 # ======================================================================
@@ -125,7 +135,7 @@ class PaperRetriever:
             # Dispatch synchronous tools into background threads
             raw_results = await asyncio.to_thread(tool_fn, **tool_args)
         except Exception as e:
-            print(f"[ERROR] tool call {tool_name}({tool_args}) failed: {e}")
+            error_logger.error(f"tool call {tool_name}({tool_args}) failed: {e}", exc_info=True)
             return []
         return self._normalize(raw_results, tool_name)
 
@@ -196,7 +206,8 @@ class RelevanceRefiner:
             try:
                 res: Score = await self._score_chain.ainvoke({"question": question, "chunk": doc.page_content})
                 score = res.score
-            except Exception:
+            except Exception as e:
+                error_logger.error(f"Error during relevance scoring: {e}", exc_info=True)
                 score = 0.0
             finally:
                 await asyncio.sleep(self._sleep_between_calls)
@@ -291,7 +302,8 @@ class ContextResponder:
                 "question": question,
                 "history": self.format_history(history, self._max_history_turns),
             })).strip()
-        except Exception:
+        except Exception as e:
+            error_logger.error(f"Error in ContextResponder: {e}", exc_info=True)
             return "Sorry, I had trouble putting that together — could you rephrase?"
 
     @staticmethod
@@ -422,7 +434,7 @@ class CRAG_Service:
 
             return {"status": "complete", **result}
         except Exception as e:
-            traceback.print_exc()
+            error_logger.error(f"Pipeline crashed: {e}", exc_info=True)
             raise RuntimeError(f"Pipeline crashed: {e}")
 
     # --- Nodes ---
@@ -461,7 +473,8 @@ class CRAG_Service:
         chain = prompt | self.llm.with_structured_output(ClassifyResult)
         try:
             res: ClassifyResult = await chain.ainvoke({"question": state["question"], "history": history})
-        except Exception:
+        except Exception as e:
+            error_logger.error(f"Error classifying intent: {e}", exc_info=True)
             res = ClassifyResult(intent=Intent.OPEN_ENDED, confidence=0.0, ambiguous=True)
 
         def _slots(obj) -> Dict[str, Any]:
@@ -505,7 +518,8 @@ class CRAG_Service:
         chain = prompt | self.llm.with_structured_output(DraftAnswer)
         try:
             res: DraftAnswer = await chain.ainvoke({"question": state["question"], "history": history})
-        except Exception:
+        except Exception as e:
+            error_logger.error(f"Error drafting answer: {e}", exc_info=True)
             res = DraftAnswer(answer="", confidence=0.0)
         return {"draft_answer": res.answer, "draft_confidence": res.confidence}
 
@@ -571,7 +585,7 @@ class CRAG_Service:
             results = await asyncio.gather(*(self._dispatch_tool_call(call) for call in tool_calls), return_exceptions=True)
             for res in results:
                 if isinstance(res, Exception):
-                    print(f"[ERROR] retrieval action failed: {res}")
+                    error_logger.error(f"retrieval action failed: {res}", exc_info=res)
                 else:
                     docs.extend(res)
         return {"raw_docs": docs}
@@ -623,14 +637,16 @@ class CRAG_Service:
         chain = ChatPromptTemplate.from_messages([("system", "Ask ONE specific clarifying question. Do not answer."), ("human", "Question: {question}")]) | self.llm | StrOutputParser()
         try:
             return (await chain.ainvoke({"question": state["question"]})).strip()
-        except Exception:
+        except Exception as e:
+            error_logger.error(f"Error generating clarifying question: {e}", exc_info=True)
             return "Could you clarify what specifically you'd like to know?"
 
     async def _rewrite_query(self, state: State) -> str:
         chain = ChatPromptTemplate.from_messages([("system", "Rewrite into a concise 6-14 word search query. Do NOT answer."), ("human", "Question: {question}")]) | self.llm | StrOutputParser()
         try:
             return (await chain.ainvoke({"question": state["question"]})).strip()
-        except Exception:
+        except Exception as e:
+            error_logger.error(f"Error rewriting query: {e}", exc_info=True)
             return state["question"]
 
     async def _rewrite_pdf_query(self, state: State) -> str:
@@ -643,7 +659,8 @@ class CRAG_Service:
         ]) | self.llm | StrOutputParser()
         try:
             return (await chain.ainvoke({"question": state["question"]})).strip()
-        except Exception:
+        except Exception as e:
+            error_logger.error(f"Error rewriting pdf query: {e}", exc_info=True)
             return state["question"]
 
 
@@ -706,25 +723,31 @@ async def main():
         except EOFError:
             break
         except Exception as e:
-            # 3. Graceful Error Handling
+            # 3. Graceful Error Handling (hidden from user as generic assistant replies)
+            error_logger.error(f"Unexpected session error: {e}", exc_info=True)
             error_msg = str(e)
+            
+            console.print("\n[bold cyan]🤖 Assistant:[/bold cyan]")
             
             # Check if it's the specific Semantic Scholar Rate Limit error
             if "429" in error_msg and "Semantic Scholar" in error_msg:
+                console.print("[bold orange3]⏳ Rate Limit Reached[/bold orange3]")
                 console.print(
-                    "\n[bold orange3]⏳ Rate Limit Reached:[/bold orange3] "
-                    "Semantic Scholar is receiving too many requests right now. "
-                    "Please wait a few seconds and try your question again."
+                    "[bold orange3]It looks like the research database is a bit busy right now. "
+                    "Please wait a few seconds and try your question again.[/bold orange3]"
                 )
             # Generic fallback for other tool failures
             elif "tool call" in error_msg.lower() or "failed" in error_msg.lower():
+                console.print("\n[bold yellow]⚠️ Search Service Issue[/bold yellow]")
                 console.print(
-                    "\n[bold yellow]⚠️ Search Service Issue:[/bold yellow] "
-                    "One of the background tools had trouble executing. Please try rephrasing your query."
+                    "[bold yellow]I had some trouble searching for that information. Could you try rephrasing your query?[/bold yellow]"
                 )
             # Completely unexpected errors
             else:
-                console.print(f"\n[bold red]❌ Unexpected Error:[/bold red] {error_msg}")
+                console.print(
+                    "[bold red]I'm sorry, I encountered a minor hiccup while processing your request. "
+                    "Let's try something else.[/bold red]"
+                )
 
     console.print("\n[bold cyan]👋 Session ended. Goodbye![/bold cyan]")
 
