@@ -4,6 +4,7 @@ import re
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
 
 from langchain_core.documents import Document
@@ -14,8 +15,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from models import ClassifyResult, DraftAnswer, Intent, Score
-from llm_factory import build_llm
-from config import LLM_CONFIG
+from llm_factory import build_llm, build_embeddings
+from config import LLM_CONFIG, EMBEDDING_PROVIDER, EMBEDDING_MODEL
+from rag_service import PdfRagService
 
 from arxiv_service import (
     batch_get_papers,
@@ -52,7 +54,13 @@ BYPASS_INTENTS = {
     Intent.RECENT_DIGEST.value,
     Intent.CITATION_GRAPH.value,
     Intent.PAPER_LOOKUP.value,
+    Intent.PAPER_QA.value,
 }
+
+# "pdf_rag_search" is not in TOOL_REGISTRY on purpose — it isn't a plain
+# metadata-fetching function like the others, it needs an embedder + a FAISS
+# store. CRAG_Service._dispatch_tool_call special-cases it and routes to
+# PdfRagService instead of PaperRetriever/TOOL_REGISTRY.
 
 # ======================================================================
 # Graph state
@@ -64,14 +72,13 @@ class State(TypedDict):
     intent: str
     intent_confidence: float
     ambiguous: bool
-    slots: Dict[str, Any]
+    actions: List[Dict[str, Any]]
     clarification_rounds: int
     clarification_answer: str
     draft_answer: str
     draft_confidence: float
     context_hint: str
-    tool_name: str
-    tool_args: Dict[str, Any]
+    tool_calls: List[Dict[str, Any]]
     search_query: str
     raw_docs: List[Document]
     good_docs: List[Document]
@@ -302,6 +309,9 @@ class CRAG_Service:
         self._generator = AnswerGenerator(self.llm)
         self._verifier = CitationVerifier()
         self._context_responder = ContextResponder(self.llm, max_history_turns=self.HISTORY_WINDOW)
+        self._pdf_rag = PdfRagService(
+            embeddings=build_embeddings(EMBEDDING_PROVIDER, EMBEDDING_MODEL, self.api_keys),
+        )
 
         self.app = self._build_graph()
 
@@ -347,7 +357,10 @@ class CRAG_Service:
     def _route_after_classify(self, state: State) -> str:
         intent = state["intent"]
         if intent == Intent.GENERAL_CHAT.value: return "context_reply"
-        if intent in BYPASS_INTENTS: return "build_query"
+        # A question that decomposed into more than one action is, by
+        # construction, a compound-but-structured request rather than an
+        # ambiguous one — skip the clarify/draft-answer detour for it too.
+        if intent in BYPASS_INTENTS or len(state.get("actions", [])) > 1: return "build_query"
         return "clarify"
 
     def _route_after_context_hint(self, state: State) -> str:
@@ -372,9 +385,9 @@ class CRAG_Service:
                 result = self.app.invoke({
                     "question": question,
                     "original_question": question,
-                    "intent": "", "intent_confidence": 0.0, "ambiguous": False, "slots": {},
+                    "intent": "", "intent_confidence": 0.0, "ambiguous": False, "actions": [],
                     "clarification_rounds": 0, "clarification_answer": "", "draft_answer": "", "draft_confidence": 0.0,
-                    "context_hint": "", "tool_name": "", "tool_args": {}, "search_query": "",
+                    "context_hint": "", "tool_calls": [], "search_query": "",
                     "raw_docs": [], "good_docs": [], "sources": {}, "refined_context": "",
                     "generated_answer": "", "generation_attempts": 0, "answer": "",
                     "verified": False, "verification_notes": "", "answered_from_context": False,
@@ -394,7 +407,18 @@ class CRAG_Service:
         self._push_status("classify", "Classifying your question…")
         history = ContextResponder.format_history(state.get("chat_history", []), self.HISTORY_WINDOW)
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a router. Classify into: GENERAL_CHAT, AUTHOR_LOOKUP, RECENT_DIGEST, CITATION_GRAPH, PAPER_LOOKUP, or OPEN_ENDED. Extract slots. Do NOT return schema or explain."),
+            ("system",
+             "You are a router for a paper-research assistant. Classify the PRIMARY intent into: "
+             "GENERAL_CHAT, AUTHOR_LOOKUP, RECENT_DIGEST, CITATION_GRAPH, PAPER_LOOKUP, PAPER_QA, or OPEN_ENDED.\n"
+             "- PAPER_LOOKUP: the user wants a paper's metadata, abstract, or PDF link — the abstract is enough.\n"
+             "- PAPER_QA: the user wants something only the paper's FULL TEXT can answer — a method, a result, "
+             "a specific section, a number that isn't in the abstract. Set paper_ids to the arXiv id(s) (or "
+             "[\"all\"] to search every paper already indexed this session) and query to a focused search "
+             "string describing what to find inside the text.\n"
+             "If the question has more than one independent part, put the main part in the primary "
+             "intent/slots and every OTHER part as its own entry in additional_actions (same fields, its own "
+             "intent) — e.g. a full-text question about one paper plus a separate recent-papers digest.\n"
+             "Extract slots for the primary intent. Do NOT return schema. Do NOT explain."),
             ("human", "Conversation so far:\n{history}\n\nQuestion: {question}"),
         ])
         chain = prompt | self.llm.with_structured_output(ClassifyResult)
@@ -402,10 +426,24 @@ class CRAG_Service:
             res: ClassifyResult = chain.invoke({"question": state["question"], "history": history})
         except Exception:
             res = ClassifyResult(intent=Intent.OPEN_ENDED, confidence=0.0, ambiguous=True)
+
+        def _slots(obj) -> Dict[str, Any]:
+            return {
+                "author_name": obj.author_name, "category": obj.category, "days": obj.days,
+                "paper_id": obj.paper_id, "citation_direction": obj.citation_direction,
+                "paper_ids": obj.paper_ids, "query": obj.query,
+            }
+
+        primary_intent = res.intent.value if isinstance(res.intent, Intent) else str(res.intent)
+        actions = [{"intent": primary_intent, **_slots(res)}]
+        for extra in res.additional_actions:
+            extra_intent = extra.intent.value if isinstance(extra.intent, Intent) else str(extra.intent)
+            actions.append({"intent": extra_intent, **_slots(extra)})
+
         return {
-            "intent": res.intent.value if isinstance(res.intent, Intent) else str(res.intent),
+            "intent": primary_intent,
             "intent_confidence": res.confidence, "ambiguous": res.ambiguous,
-            "slots": {"author_name": res.author_name, "category": res.category, "days": res.days, "paper_id": res.paper_id, "citation_direction": res.citation_direction},
+            "actions": actions,
         }
 
     def clarify(self, state: State) -> Dict[str, Any]:
@@ -450,22 +488,63 @@ class CRAG_Service:
         return {"answer": answer, "verified": True, "verification_notes": "Draft used.", "answered_from_context": True, **self._history_delta(state, answer)}
 
     def build_query(self, state: State) -> Dict[str, Any]:
-        self._push_status("build_query", "Selecting tool…")
-        intent, slots = state["intent"], state.get("slots", {}) or {}
-        if intent == Intent.AUTHOR_LOOKUP.value: return {"tool_name": "get_author_papers", "tool_args": {"author": slots.get("author_name") or state["question"]}}
-        if intent == Intent.RECENT_DIGEST.value: return {"tool_name": "get_recent_papers", "tool_args": {"category": slots.get("category") or self.DEFAULT_CATEGORY, "days": slots.get("days") or self.DEFAULT_RECENT_DAYS}}
+        actions = state.get("actions") or [{"intent": state["intent"]}]
+        self._push_status("build_query", f"Selecting tool{'s' if len(actions) > 1 else ''}…")
+        tool_calls = [self._action_to_tool_call(state, action) for action in actions]
+        search_query = next(
+            (c["tool_args"].get("query") for c in tool_calls if c.get("tool_args", {}).get("query")), ""
+        )
+        return {"tool_calls": tool_calls, "search_query": search_query}
+
+    def _action_to_tool_call(self, state: State, action: Dict[str, Any]) -> Dict[str, Any]:
+        intent = action.get("intent")
+        if intent == Intent.AUTHOR_LOOKUP.value:
+            return {"tool_name": "get_author_papers", "tool_args": {"author": action.get("author_name") or state["question"]}}
+        if intent == Intent.RECENT_DIGEST.value:
+            return {"tool_name": "get_recent_papers", "tool_args": {"category": action.get("category") or self.DEFAULT_CATEGORY, "days": action.get("days") or self.DEFAULT_RECENT_DAYS}}
         if intent == Intent.CITATION_GRAPH.value:
-            tool_name = "get_paper_citations" if (slots.get("citation_direction") or "incoming") == "incoming" else "get_related_papers"
-            return {"tool_name": tool_name, "tool_args": {"paper_id": slots.get("paper_id")}}
+            tool_name = "get_paper_citations" if (action.get("citation_direction") or "incoming") == "incoming" else "get_related_papers"
+            return {"tool_name": tool_name, "tool_args": {"paper_id": action.get("paper_id")}}
         if intent == Intent.PAPER_LOOKUP.value:
             tool_name = "get_paper_pdf_url" if any(kw in state["question"].lower() for kw in ("pdf", "download")) else "get_paper_details"
-            return {"tool_name": tool_name, "tool_args": {"paper_id": slots.get("paper_id")}}
-        query = self._rewrite_query(state)
-        return {"tool_name": "search_semantic_scholar", "tool_args": {"query": query}, "search_query": query}
+            return {"tool_name": tool_name, "tool_args": {"paper_id": action.get("paper_id")}}
+        if intent == Intent.PAPER_QA.value:
+            paper_ids = action.get("paper_ids") or ([action["paper_id"]] if action.get("paper_id") else ["all"])
+            query = action.get("query") or self._rewrite_pdf_query(state)
+            return {"tool_name": "pdf_rag_search", "tool_args": {"paper_ids": paper_ids, "query": query}}
+        query = action.get("query") or self._rewrite_query(state)
+        return {"tool_name": "search_semantic_scholar", "tool_args": {"query": query}}
 
     def retrieve(self, state: State) -> Dict[str, Any]:
-        self._push_status("retrieve", "Fetching papers…")
-        return {"raw_docs": self._retriever.retrieve(state.get("tool_name", ""), state.get("tool_args", {}) or {})}
+        tool_calls = state.get("tool_calls") or []
+        self._push_status("retrieve", f"Fetching from {len(tool_calls)} source(s)…" if len(tool_calls) != 1 else "Fetching papers…")
+
+        if len(tool_calls) <= 1:
+            docs = self._dispatch_tool_call(tool_calls[0]) if tool_calls else []
+        else:
+            # Independent, I/O-bound calls (HTTP lookups and/or PDF download +
+            # indexing) — run them concurrently so one slow PAPER_QA action
+            # doesn't serialize behind the others. Each call is isolated so
+            # one failure doesn't drop the rest of the results.
+            docs = []
+            with ThreadPoolExecutor(max_workers=min(4, len(tool_calls))) as pool:
+                futures = [pool.submit(self._dispatch_tool_call, call) for call in tool_calls]
+                for future in futures:
+                    try:
+                        docs.extend(future.result())
+                    except Exception as e:
+                        print(f"[ERROR] retrieval action failed: {e}")
+        return {"raw_docs": docs}
+
+    def _dispatch_tool_call(self, call: Dict[str, Any]) -> List[Document]:
+        tool_name, tool_args = call.get("tool_name", ""), call.get("tool_args", {}) or {}
+        if tool_name == "pdf_rag_search":
+            return self._pdf_rag.retrieve(
+                paper_ids=tool_args.get("paper_ids") or ["all"],
+                query=tool_args.get("query", ""),
+                on_status=self._push_status,
+            )
+        return self._retriever.retrieve(tool_name, tool_args)
 
     def refine(self, state: State) -> Dict[str, Any]:
         self._push_status("refine", "Filtering and attributing sources…")
@@ -508,6 +587,19 @@ class CRAG_Service:
 
     def _rewrite_query(self, state: State) -> str:
         chain = ChatPromptTemplate.from_messages([("system", "Rewrite into a concise 6-14 word search query. Do NOT answer."), ("human", "Question: {question}")]) | self.llm | StrOutputParser()
+        try:
+            return chain.invoke({"question": state["question"]}).strip()
+        except Exception:
+            return state["question"]
+
+    def _rewrite_pdf_query(self, state: State) -> str:
+        """Fallback for PAPER_QA when classify() didn't already fill in a
+        focused `query` — rewrites the question into a search string aimed at
+        the paper's full text rather than at ArXiv/Semantic Scholar."""
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "Rewrite into a focused 6-14 word search query for searching WITHIN a paper's full text. Do NOT answer."),
+            ("human", "Question: {question}"),
+        ]) | self.llm | StrOutputParser()
         try:
             return chain.invoke({"question": state["question"]}).strip()
         except Exception:

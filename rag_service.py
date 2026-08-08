@@ -16,11 +16,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pypdf import PdfReader
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -131,18 +131,13 @@ class PdfChunker:
         self, path: Path, paper_id: str, extra_metadata: Dict[str, Any]
     ) -> List[Document]:
         try:
-            reader = PdfReader(str(path))
+            loader = PyPDFLoader(str(path))
+            loaded_docs = loader.load()
         except Exception as e:
             logger.warning(f"[pdf_rag] could not open PDF for {paper_id}: {e}")
             return []
 
-        pages: List[str] = []
-        for i, page in enumerate(reader.pages):
-            try:
-                pages.append(page.extract_text() or "")
-            except Exception as e:
-                logger.debug(f"[pdf_rag] page {i} extraction failed for {paper_id}: {e}")
-                pages.append("")
+        pages: List[str] = [doc.page_content or "" for doc in loaded_docs]
 
         full_text = "\n\n".join(t for t in pages if t.strip())
         if not full_text.strip():
