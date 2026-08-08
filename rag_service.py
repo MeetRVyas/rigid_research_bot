@@ -1,5 +1,5 @@
 """
-Full-text PDF RAG for the CRAG pipeline.
+Full-text PDF RAG for the Veritas pipeline.
 
 Dependencies this adds beyond what main.py already uses:
     pip install pypdf faiss-cpu langchain-text-splitters langchain-community --break-system-packages
@@ -43,7 +43,7 @@ def _build_session() -> requests.Session:
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1.5, status_forcelist=(429, 500, 502, 503, 504))
     session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.headers.update({"User-Agent": "CRAG-PdfRag/1.0 (research tool)"})
+    session.headers.update({"User-Agent": "Veritas-PdfRag/1.0 (research tool)"})
     return session
 
 

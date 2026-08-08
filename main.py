@@ -116,7 +116,7 @@ logging.Formatter.converter = ist_converter
 
 # Graceful Error Logging Setup
 os.makedirs("logs", exist_ok=True)
-error_logger = logging.getLogger("crag_error_logger")
+error_logger = logging.getLogger("veritas_error_logger")
 error_logger.setLevel(logging.ERROR)
 error_logger.propagate = False
 if not error_logger.handlers:
@@ -496,10 +496,10 @@ CONSTRAINTS:
 
 
 # ======================================================================
-# Standalone CLI CRAG Service
+# Standalone CLI Veritas Service
 # ======================================================================
 
-class CRAG_Service:
+class Veritas_Service:
     LOWER_THRESHOLD = 0.3
     DRAFT_CONFIDENCE_THRESHOLD = 0.6
     MAX_CLARIFICATION_ROUNDS = 2
@@ -615,7 +615,7 @@ class CRAG_Service:
         # 4. If it's clear and specific, go straight to tools
         if intent in BYPASS_INTENTS or len(state.get("actions", [])) > 1: return "build_query"
 
-        # 5. If it's clear but OPEN_ENDED, check if the LLM knows it already (CRAG)
+        # 5. If it's clear but OPEN_ENDED, check if the LLM knows it already (Veritas)
         return "draft_answer"
 
     def _route_after_context_hint(self, state: State) -> str:
@@ -1057,10 +1057,10 @@ async def main():
     )
     console.print(Panel(welcome_text, title=f"🤖 RAG Agent (Session: {session_id[:8]})", border_style="cyan"))
 
-    history_file = os.path.join(os.path.expanduser("~"), ".crag_cli_history")
+    history_file = os.path.join(os.path.expanduser("~"), ".veritas_cli_history")
     session = PromptSession(history=FileHistory(history_file))
 
-    service = CRAG_Service(session_id=session_id)
+    service = Veritas_Service(session_id=session_id)
     service.save_graph()
 
     while True:

@@ -5,7 +5,7 @@ Thin adapter over the arxiv-mcp-server's underlying clients
 (.arxiv / .semantic_scholar) — exposes the same 12
 capabilities as the MCP tools in /server.py, but as plain,
 directly-importable functions returning bare dicts/lists (no MCP envelope,
-no Context, no ToolAnnotations), so CRAG_Service.TOOL_REGISTRY can call
+no Context, no ToolAnnotations), so Veritas_Service.TOOL_REGISTRY can call
 them straight, keyed by the same names it already imports:
 
     search_papers, get_paper_details, get_paper_pdf_url, get_recent_papers,
@@ -16,13 +16,9 @@ them straight, keyed by the same names it already imports:
 Every function here mirrors the corresponding tool body in server.py
 (validation, clamping, Semantic Scholar enrichment) — only the MCP-protocol
 plumbing (ctx, envelope dicts, _run_tool's error-to-envelope wrapping) is
-stripped out, since CRAG_Service.retrieve_and_refine already wraps each
+stripped out, since Veritas_Service.retrieve_and_refine already wraps each
 tool call in its own try/except and treats a raised exception as "no
 results" for that step.
-
-Parameter names below (paper_id, author, category, days, query) are chosen
-to match what crag_service.py's build_query already passes as kwargs — so
-no changes are needed on that side.
 
 Requires the arxiv-mcp-server package to be an importable dependency of this
 app (pip install / path dependency exposing the `` package). If
