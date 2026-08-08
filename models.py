@@ -68,11 +68,12 @@ class KeepOrDrop(BaseModel):
     keep: bool = Field(description="True if sentence is directly relevant")
 
 
-class CitationSupport(BaseModel):
-    supported: bool = Field(
-        description="True only if the source text factually supports the claim — topical overlap alone does not count"
-    )
-    reason: str = Field(description="Brief justification for the verdict")
+class ClaimVerification(BaseModel):
+    label: str = Field(description="The citation marker label, e.g., '1', '2'")
+    supported: bool = Field(description="Whether the source factually supports the claim")
+
+class BatchCitationSupport(BaseModel):
+    results: list[ClaimVerification]
 
 
 class CRAGRequest(BaseModel):

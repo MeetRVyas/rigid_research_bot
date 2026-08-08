@@ -29,7 +29,7 @@ from langgraph.types import Command, interrupt
 from dotenv import load_dotenv
 load_dotenv()
 
-from models import ClassifyResult, CitationSupport, DraftAnswer, Intent, Score
+from models import ClassifyResult, BatchCitationSupport, DraftAnswer, Intent, Score
 from llm_factory import build_llm, build_embeddings
 from config import LLM_CONFIG_PATH, EMBEDDING_PROVIDER, EMBEDDING_MODEL
 from rag_service import PdfRagService
@@ -364,19 +364,20 @@ class CitationVerifier:
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a STRICT fact-checker for a citation-verification pipeline.
-You will be given a CLAIM taken from a generated answer, and the SOURCE text that the answer cited immediately after that claim.
+You will be given a list of CLAIMS taken from a generated answer, along with the SOURCE text cited for each claim.
 
-Determine whether the SOURCE factually supports the CLAIM.
+Determine whether EACH source factually supports its corresponding claim.
 
 RULES:
 1. Be strict: topical overlap or a merely related subject does NOT count as support.
 2. The SOURCE does not need to state the claim word-for-word, but the specific fact/number/conclusion in the CLAIM must be traceable to the SOURCE.
-3. If the CLAIM is a general statement not really asserting anything checkable (e.g. a transition sentence), treat it as supported."""),
-            ("human", "CLAIM: {claim}\n\nSOURCE:\n{source_text}"),
+3. If the CLAIM is a general statement not really asserting anything checkable (e.g. a transition sentence), treat it as supported.
+4. Evaluate each claim independently."""),
+            ("human", "Here are the claims to verify:\n\n{batched_claims}"),
         ])
-        self._support_chain = prompt | llm.with_structured_output(CitationSupport)
+        self._support_chain = prompt | llm.with_structured_output(BatchCitationSupport)
 
-    async def verify(self, answer: str, sources: Dict[str, Dict[str, Any]]) -> Tuple[bool, str]:
+    async def verify(self, answer: str, sources: Dict[str, Dict[str, Any]], batch_size: int = 5) -> Tuple[bool, str]:
         used = set(self._MARKER_RE.findall(answer))
         valid = set(sources.keys())
         invalid = used - valid
@@ -388,37 +389,47 @@ RULES:
         if not sources:
             return True, "No sources to verify against."
 
-        unsupported = await self._check_semantic_support(answer, sources)
+        unsupported = await self._check_semantic_support(answer, sources, batch_size)
         if unsupported:
             return False, f"Claim(s) not factually supported by their cited source(s): {sorted(unsupported)}"
         return True, "All citations verified against retrieved sources."
 
-    async def _check_single_claim(self, label: str, claim: str, source_text: str) -> Tuple[str, bool]:
-        async with self._semaphore:
-            try:
-                res: CitationSupport = await self._support_chain.ainvoke({"claim": claim, "source_text": source_text})
-                return label, res.supported
-            except Exception as e:
-                error_logger.error(f"Error during semantic citation check: {e}", exc_info=True)
-                # Fail open on infra errors (LLM outage/rate limit)
-                return label, True 
-
-    async def _check_semantic_support(self, answer: str, sources: Dict[str, Dict[str, Any]]) -> List[str]:
+    async def _check_semantic_support(self, answer: str, sources: Dict[str, Dict[str, Any]], batch_size: int) -> List[str]:
         tasks = []
+        claims_to_check = []
         for label, claim in self._extract_claims(answer):
             source_text = sources.get(label, {}).get("content") or sources.get(label, {}).get("title", "")
 
             if source_text:
-                tasks.append(self._check_single_claim(label, claim, source_text))
-        
-        results = await asyncio.gather(*tasks)
+                claims_to_check.append((label, claim, source_text))
 
-        unsupported: List[str] = []
-        for label, supported in results:
-            if not supported and label not in unsupported:
-                unsupported.append(label)
-        
-        return unsupported
+        if not claims_to_check:
+            return []
+
+        for batch_idx  in range(0, len(claims_to_check), batch_size) :
+            batched_text = ""
+            for item_idx, (label, claim, source) in enumerate(claims_to_check[batch_idx  : batch_idx  + batch_size], 1):
+                batched_text += f"--- ITEM {item_idx} ---\nLABEL: {label}\nCLAIM: {claim}\nSOURCE:\n{source}\n\n"
+            task = asyncio.create_task(self._support_chain.ainvoke({"batched_claims": batched_text}))
+            tasks.append(task)
+    
+        try:
+            result = await asyncio.gather(*tasks, return_exceptions=True)
+
+            unsupported: List[str] = []
+            for res in result :
+                if isinstance(res, Exception) :
+                    continue
+                for item in res.results :
+                    if not item.supported and item.label not in unsupported:
+                            unsupported.append(item.label)
+                        
+            return unsupported
+
+        except Exception as e:
+            error_logger.error(f"Error during batch semantic citation check: {e}", exc_info=True)
+            # Fail open if the LLM crashes so we don't break the whole app
+            return []
 
     @classmethod
     def _extract_claims(cls, answer: str) -> List[Tuple[str, str]]:
@@ -534,10 +545,7 @@ class CRAG_Service:
         """Saves the LangGraph architecture as a PNG image."""
         try:
             # fetches the image bytes
-            image_bytes = self.app.get_graph().draw_mermaid_png()
-            
-            with open(filename, "wb") as f:
-                f.write(image_bytes)
+            self.app.get_graph().draw_mermaid_png(output_file_path=filename)
                 
             print(f"✅ Graph successfully saved to {filename}")
         except Exception as e:
@@ -623,6 +631,11 @@ class CRAG_Service:
     def _route_after_map_reduce(self, state: State) -> str:
         return "synthesize_comparison" if state.get("per_paper_answers") else "no_results"
 
+    def _route_after_verify(self, state: State) -> str:
+        if state.get("verified") or state.get("generation_attempts", 0) >= self.MAX_GENERATION_ATTEMPTS:
+            return "finalize"
+        return "generate"
+
     @staticmethod
     def _find_multi_paper_qa_action(state: State) -> Dict[str, Any]:
         """Returns the PAPER_QA action naming more than one explicit paper
@@ -646,11 +659,6 @@ class CRAG_Service:
         if len(paper_ids) > 1 and "all" not in normalized:
             return action
         return {}
-
-    def _route_after_verify(self, state: State) -> str:
-        if state.get("verified") or state.get("generation_attempts", 0) >= self.MAX_GENERATION_ATTEMPTS:
-            return "finalize"
-        return "generate"
 
     async def run(self, question: Optional[str] = None, resume_answer: Optional[str] = None, thread_id: Optional[str] = None) -> dict:
         config = {"configurable": {"thread_id": thread_id or self.session_id}}
@@ -874,9 +882,17 @@ CONFIDENCE RUBRIC:
         self._push_status("paper_qa_map", f"Researching {len(paper_ids)} papers independently…")
 
         map_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert research assistant. Your task is to extract information from the provided paper context that is relevant to the user's query.\n"
-                       "CRITICAL: If the user query asks to compare this paper with another, DO NOT complain that the other paper is missing. Just extract the facts, methodologies, or findings about THIS paper so they can be compared later.\n"
-                       "Be concise, highly factual, and do NOT use citation markers."),
+            ("system", """You are a meticulous academic research assistant extracting factual information from a single scientific paper.
+Your objective is to answer the user's query using ONLY the provided Paper Context.
+
+STRICT RULES:
+1. NO HALLUCINATION: Base your entire response solely on the provided text. Never use external knowledge, even if you know the paper well.
+2. HONESTY: If the context lacks sufficient information to answer the query, output EXACTLY: "Insufficient information in the provided context." Do not guess, infer, or hallucinate.
+3. ISOLATED EXTRACTION: If the query asks to compare this paper with another, ignore the missing paper. Extract ONLY the methodologies, results, and facts relevant to THIS paper so they can be compared later. Do not state that the other paper is missing.
+4. CONCISENESS: Be direct, objective, and highly factual. Avoid conversational filler (e.g., "The paper states that...").
+5. NO CITATION MARKERS: Do not include bracketed reference numbers (e.g., [1]) or author-year citations in your output.
+
+Focus purely on extracting the most accurate and relevant details for the user's query."""),
             ("human", "User Query: {query}\n\nPaper Context:\n{context}")
         ])
         map_chain = map_prompt | self.llm | StrOutputParser()
