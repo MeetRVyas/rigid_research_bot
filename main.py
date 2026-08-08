@@ -186,9 +186,18 @@ class RelevanceRefiner:
         self._sleep_between_calls = sleep_between_calls
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a strict retrieval evaluator for a paper-search RAG pipeline.\n"
-                       "Score how relevant this paper is to the question, in [0.0, 1.0].\n"
-                       "Be conservative with high scores.\nDo NOT return schema. Do NOT explain."),
+            ("system", """You are a STRICT retrieval evaluator for a scientific paper-search RAG pipeline.
+Your task is to score how RELEVANT the provided paper chunk is to the user's question on a scale of 0.0 to 1.0.
+
+SCORING RUBRIC:
+- 0.8 to 1.0: HIGHLY relevant. The chunk directly answers the core question or provides critical requested details.
+- 0.4 to 0.7: PARTIALLY relevant. The chunk discusses related topics but does not directly answer the main question.
+- 0.0 to 0.3: IRRELEVANT. The chunk is off-topic or merely shares generic keywords without meaningful context.
+
+RULES:
+1. Be highly conservative with scores above 0.7.
+2. Evaluate based purely on the semantic overlap of concepts, not just keyword matching.
+3. Do NOT explain your reasoning. Output ONLY the evaluation score."""),
             ("human", "Question: {question}\n\nPaper:\n{chunk}"),
         ])
         self._score_chain = prompt | llm.with_structured_output(Score)
@@ -238,12 +247,17 @@ class AnswerGenerator:
 
     async def generate(self, question: str, context: str, strict: bool = False) -> str:
         system = (
-            "You are a research assistant. Answer ONLY using the provided sources.\n"
-            "Every factual claim MUST be followed by a citation marker like [1], [2].\n"
-            "If the sources are insufficient, say so plainly instead of guessing."
+            "You are an expert academic research assistant.\n"
+            "Your task is to synthesize a comprehensive, accurate answer to the user's question using ONLY the provided sources.\n\n"
+            
+            "CRITICAL INSTRUCTIONS:\n"
+            "1. NO HALLUCINATION: If the answer cannot be found in the provided sources, explicitly state: 'The provided sources do not contain sufficient information to answer this question.' Do not guess.\n"
+            "2. MANDATORY CITATIONS: Every factual claim, statistic, or methodological detail MUST be immediately followed by a citation marker corresponding to the source (e.g., [1], [2]).\n"
+            "3. SYNTHESIS: Combine insights from multiple sources where appropriate rather than listing them out one by one.\n"
+            "4. TONE: Maintain an objective, scholarly tone."
         )
         if strict:
-            system += "\nIMPORTANT: Only use marker numbers that actually appear in the sources."
+            system += "\n5. STRICT CITATION MATCHING: Only use marker numbers that explicitly appear in the provided sources. Do not invent citation numbers."
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", system),
@@ -291,7 +305,14 @@ class ContextResponder:
     def __init__(self, llm, max_history_turns: int = 6):
         self._max_history_turns = max_history_turns
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a friendly research-assistant. Answer directly using conversation history. Do NOT claim to have searched ArXiv."),
+            ("system", """You are a helpful, conversational research assistant.
+Your task is to answer the user's question directly based on the ongoing conversation history.
+
+CONSTRAINTS:
+1. Rely entirely on the provided conversation history.
+2. Keep your response concise and conversational.
+3. NEVER claim to have searched ArXiv, Semantic Scholar, or any external database in this response.
+4. If the user asks a new question that requires scientific literature, politely inform them that you will need to search the database for that."""),
             ("human", "Conversation so far:\n{history}\n\nUser: {question}"),
         ])
         self._chain = prompt | llm | StrOutputParser()
@@ -443,30 +464,26 @@ class CRAG_Service:
         history = ContextResponder.format_history(state.get("chat_history", []), self.HISTORY_WINDOW)
         prompt = ChatPromptTemplate.from_messages([
             ("system",
-            "You are an expert routing assistant for a scientific paper-research tool. "
-            "Your job is to classify the user's PRIMARY intent into exactly one of the following categories.\n\n"
+            "You are an expert intent routing assistant for a scientific literature RAG system.\n"
+            "Your task is to classify the user's PRIMARY intent into exactly ONE of the categories below, and extract relevant slots.\n\n"
             
             "CATEGORIES:\n"
-            "- PAPER_LOOKUP: The user asks for high-level metadata (abstract, authors, publication date, or PDF link) for specific papers.\n"
-            "- PAPER_QA: The user asks about the internal content, methodology, results, or specific details of one or more papers. "
-            "**This includes comparing specific papers.** Require this if answering needs the FULL TEXT. "
-            "Extract slots: `paper_ids` (list of arXiv IDs, or [\"all\"] to search all session papers) and `query` (focused search string of what to find inside the text).\n"
-            "- AUTHOR_LOOKUP: The user wants to find papers written by a specific named person.\n"
-            "- RECENT_DIGEST: The user asks for new, recent, or latest developments in a specific category or time window.\n"
-            "- CITATION_GRAPH: The user asks what a specific paper cites (references) or what cites it (forward citations).\n"
-            "- GENERAL_CHAT: Casual conversation, greetings, or questions that do NOT require searching the paper database at all.\n"
-            "- OPEN_ENDED: STRICT FALLBACK. Use ONLY for extremely broad, thematic literature queries that lack specific papers, authors, or timeframes. "
-            "If the user mentions a specific paper, method, or author, DO NOT USE THIS.\n\n"
+            "- PAPER_LOOKUP: Use when the user asks for metadata (abstract, authors, publication date, PDF link) of a SPECIFIC paper.\n"
+            "- PAPER_QA: Use when the user asks about the internal content, methodology, results, or wants to COMPARE specific papers. (Requires full-text). Extract slots: `paper_ids` (list of arXiv IDs, or [\"all\"] for session papers) and `query` (focused search string to find inside the text).\n"
+            "- AUTHOR_LOOKUP: Use when the user specifically searches for publications by a named author.\n"
+            "- RECENT_DIGEST: Use when the user asks for new, recent, or latest developments within a category/timeframe.\n"
+            "- CITATION_GRAPH: Use when the user asks about references (what this paper cites) or forward citations (what cites this paper).\n"
+            "- GENERAL_CHAT: Use for casual conversation, greetings, or follow-ups that rely entirely on chat history without needing a database search.\n"
+            "- OPEN_ENDED: STRICT FALLBACK. Use ONLY for broad, thematic literature searches lacking specific papers, authors, or timeframes.\n\n"
             
-            "MULTI-PART QUESTIONS:\n"
-            "If the query has multiple independent parts, assign the main part to the primary intent and slots. "
-            "Put every OTHER independent part as its own entry in `additional_actions` (with its own intent and slots). "
-            "Example: A full-text question about one paper (PAPER_QA) plus a separate request for recent papers (RECENT_DIGEST).\n\n"
+            "MULTI-PART INSTRUCTIONS:\n"
+            "If the query contains independent requests (e.g., 'Summarize paper X and also find recent AI papers'), assign the main focus to the primary intent. "
+            "Assign secondary requests to `additional_actions` with their respective intents and slots.\n\n"
             
             "CRITICAL RULES:\n"
-            "1. Never classify as OPEN_ENDED if the user names a paper, an author, or asks for recent papers.\n"
-            "2. If the user asks to compare papers, use PAPER_QA.\n"
-            "3. Extract slots for the primary intent. Do NOT return schema. Do NOT explain your reasoning."
+            "1. NEVER use OPEN_ENDED if the user names a specific paper, author, or asks for recent papers.\n"
+            "2. ALWAYS use PAPER_QA if the user asks to compare specific papers.\n"
+            "3. Extract all available slots accurately based strictly on the user's exact wording."
             ),
             ("human", "Conversation so far:\n{history}\n\nQuestion: {question}"),
         ])
@@ -512,7 +529,14 @@ class CRAG_Service:
         self._push_status("draft_answer", "Drafting a preliminary answer…")
         history = ContextResponder.format_history(state.get("chat_history", []), self.HISTORY_WINDOW)
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "Answer the question from general knowledge alone. Rate your confidence [0.0, 1.0]."),
+            ("system", """You are an expert AI answering questions based on your internal knowledge.
+Provide a detailed draft answer to the user's question. 
+Additionally, assess your confidence in this answer on a scale of 0.0 to 1.0.
+
+CONFIDENCE RUBRIC:
+- 0.9 to 1.0: You know this as established, undeniable fact (e.g., standard math formulas, highly famous papers).
+- 0.6 to 0.8: You are fairly certain but might miss recent developments or specific nuances.
+- 0.0 to 0.5: You are guessing, recalling vaguely, or the topic requires highly specific, recent literature retrieval."""),
             ("human", "Conversation:\n{history}\n\nQuestion: {question}"),
         ])
         chain = prompt | self.llm.with_structured_output(DraftAnswer)
@@ -634,7 +658,12 @@ class CRAG_Service:
         return {"chat_history": [{"role": "user", "content": state.get("original_question") or state["question"]}, {"role": "assistant", "content": final_answer}]}
 
     async def _generate_clarifying_question(self, state: State) -> str:
-        chain = ChatPromptTemplate.from_messages([("system", "Ask ONE specific clarifying question. Do not answer."), ("human", "Question: {question}")]) | self.llm | StrOutputParser()
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful research assistant. The user's query is ambiguous. "
+                       "Ask EXACTLY ONE concise, clarifying question to help narrow down their exact intent, preferred authors, timeframes, or specific papers. "
+                       "Do NOT attempt to answer the user's query."), 
+            ("human", "Question: {question}")
+        ]) | self.llm | StrOutputParser()
         try:
             return (await chain.ainvoke({"question": state["question"]})).strip()
         except Exception as e:
@@ -642,7 +671,15 @@ class CRAG_Service:
             return "Could you clarify what specifically you'd like to know?"
 
     async def _rewrite_query(self, state: State) -> str:
-        chain = ChatPromptTemplate.from_messages([("system", "Rewrite into a concise 6-14 word search query. Do NOT answer."), ("human", "Question: {question}")]) | self.llm | StrOutputParser()
+        chain = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert search query optimizer. "
+                       "Convert the user's question into a keyword-dense search query (6-14 words) for an academic database.\n"
+                       "RULES:\n"
+                       "1. Remove conversational filler (e.g., 'Can you find papers on...').\n"
+                       "2. Focus strictly on core entities, methodologies, and technical terms.\n"
+                       "3. Do NOT phrase it as a question. Output ONLY the optimized keywords."), 
+            ("human", "Question: {question}")
+        ]) | self.llm | StrOutputParser()
         try:
             return (await chain.ainvoke({"question": state["question"]})).strip()
         except Exception as e:
@@ -654,8 +691,13 @@ class CRAG_Service:
         focused `query` — rewrites the question into a search string aimed at
         the paper's full text rather than at ArXiv/Semantic Scholar."""
         chain = ChatPromptTemplate.from_messages([
-            ("system", "Rewrite into a focused 6-14 word search query for searching WITHIN a paper's full text. Do NOT answer."),
-            ("human", "Question: {question}"),
+            ("system", "You are an expert at full-text document retrieval. "
+                       "Convert the user's question into a highly focused search string (6-14 words) optimized for vector search WITHIN a specific academic paper.\n"
+                       "RULES:\n"
+                       "1. Focus on specific variables, methodology steps, results, or unique claims.\n"
+                       "2. Remove generic academic filler (e.g., 'What does the paper say about...').\n"
+                       "3. Output ONLY the optimized search string."), 
+            ("human", "Question: {question}")
         ]) | self.llm | StrOutputParser()
         try:
             return (await chain.ainvoke({"question": state["question"]})).strip()
