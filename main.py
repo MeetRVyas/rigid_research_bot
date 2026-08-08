@@ -10,12 +10,12 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 
 import warnings
+
 import logging
+from datetime import datetime, timezone, timedelta
 
 import operator
 import re
-import time
-import traceback
 import uuid
 from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
 
@@ -103,9 +103,16 @@ BYPASS_INTENTS = {
 
 warnings.filterwarnings("ignore")
 
-# 2. Hide internal library error logs (like the [ERROR] tool call... message)
-# This forces libraries to only print CRITICAL issues, hiding standard warnings/errors
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def ist_converter(sec=None):
+    if sec is None:
+        sec = datetime.now().timestamp()
+    # Convert the raw timestamp to IST, then to a time-tuple that logging expects
+    return datetime.fromtimestamp(sec, tz=IST).timetuple()
+
 logging.getLogger().setLevel(logging.CRITICAL)
+logging.Formatter.converter = ist_converter
 
 # Graceful Error Logging Setup
 os.makedirs("logs", exist_ok=True)
@@ -403,13 +410,13 @@ RULES:
 
             if source_text:
                 tasks.append(self._check_single_claim(label, claim, source_text))
-            
-            results = await asyncio.gather(*tasks)
+        
+        results = await asyncio.gather(*tasks)
 
-            unsupported: List[str] = []
-            for label, supported in results:
-                if not supported and label not in unsupported:
-                    unsupported.append(label)
+        unsupported: List[str] = []
+        for label, supported in results:
+            if not supported and label not in unsupported:
+                unsupported.append(label)
         
         return unsupported
 
@@ -522,6 +529,19 @@ class CRAG_Service:
     def _push_status(self, step: str, message: str) -> None:
         """Terminal-friendly status display."""
         print(f" ⚙️  [{step}] {message}")
+
+    def save_graph(self, filename: str = "docs/graph.png"):
+        """Saves the LangGraph architecture as a PNG image."""
+        try:
+            # fetches the image bytes
+            image_bytes = self.app.get_graph().draw_mermaid_png()
+            
+            with open(filename, "wb") as f:
+                f.write(image_bytes)
+                
+            print(f"✅ Graph successfully saved to {filename}")
+        except Exception as e:
+            print(f"❌ Failed to save graph: {e}")
 
     def _build_graph(self):
         workflow = StateGraph(State)
@@ -1025,6 +1045,7 @@ async def main():
     session = PromptSession(history=FileHistory(history_file))
 
     service = CRAG_Service(session_id=session_id)
+    service.save_graph()
 
     while True:
         try:
