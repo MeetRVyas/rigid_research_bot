@@ -26,10 +26,9 @@ Auto-fallback
 """
 
 import os
-from typing import Callable, Optional, Dict
+from typing import Callable
 import time
 
-from langchain_core.language_models import BaseChatModel
 from langchain_core.embeddings import Embeddings
 
 from config import (
@@ -37,10 +36,7 @@ from config import (
     MAX_LLM_RETRIES_ON_API_LIMITS,
     LIMIT_HIT_RETRY_BASE_DELAY,
 )
-from llm import (
-    RetryConfig,
-    MultiProviderChatLLM,
-)
+from pool_manager.llm import MultiProviderChatLLM, get_llm
 
 
 _model_cache: dict[str, Embeddings] = {}
@@ -81,52 +77,9 @@ def retry_embeddings(Embedding_Class, params: dict, max_attempts: int = 6, base_
 # ===========================================================================
 
 def build_llm(
-    config:       Dict[str, Dict],
-    retry_config: Optional[RetryConfig] = None,
+    config_path : str
 ) -> MultiProviderChatLLM:
-    """
-    Build a MultiProviderChatLLM from a provider config dict.
-
-    Config shape
-    ────────────
-    {
-        "<provider_name>": {
-            "keys":     ["key1", "key2"],           # required — API keys
-            "models":   ["model-a", "model-b"],     # required — model IDs
-            "base_url": "https://...",              # optional — custom base URL
-        },
-        ...
-    }
-
-    Providers are tried in insertion order (Python 3.7+ dict ordering).
-    Within each provider every (key, model) pair is a separate endpoint and
-    they are round-robined.
-
-    Example
-    ───────
-    llm = get_llm(
-        config={
-            "openai": {
-                "keys":   ["sk-aaa", "sk-bbb"],
-                "models": ["gpt-4o", "gpt-4o-mini"],
-            },
-            "anthropic": {
-                "keys":   ["sk-ant-xxx"],
-                "models": ["claude-3-5-sonnet-20241022"],
-            },
-            "groq": {
-                "keys":   ["gsk_yyy"],
-                "models": ["llama-3.1-70b-versatile"],
-                "base_url": "https://api.groq.com/openai/v1",
-            },
-        },
-        retry_config=RetryConfig(max_retries=2, cooldown_seconds=30),
-    )
-    """
-    return MultiProviderChatLLM(
-        providers_config=config,
-        retry_config=retry_config or RetryConfig(),
-    )
+    return get_llm(config_path)
 
 # ===========================================================================
 # Embeddings factory
@@ -183,11 +136,19 @@ _EMBEDDING_REGISTRY: dict[str, Callable[[str, dict], Embeddings]] = {
 def build_embeddings(
     provider: str,
     model: str,
-    api_keys: Optional[dict] = None,
 ) -> Embeddings:
     """Build and return an Embeddings object for the selected provider."""
-    api_keys = api_keys or {}
+    import yaml
+    import os
+    from config import LLM_CONFIG_PATH
+
+    with open(LLM_CONFIG_PATH) as f :
+        config = yaml.safe_load(f)
+    
+    api_keys = {}
     provider = provider.lower()
+
+    api_keys[provider] = os.environ.get(config.get(provider, {}).get("embedding_key", None))
 
     builder = _EMBEDDING_REGISTRY.get(provider)
     if builder is None:

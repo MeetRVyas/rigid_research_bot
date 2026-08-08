@@ -33,9 +33,6 @@ class Settings(BaseSettings):
     # Semantic Scholar
     semantic_scholar_api_key: str | None = Field(default=None, alias="SEMANTIC_SCHOLAR_API_KEY")
 
-    # HTTP access control
-    rate_limit_per_minute: int = Field(default=30, alias="RATE_LIMIT_PER_MINUTE")
-
     # Outbound HTTP behavior
     request_deadline_seconds: float = Field(default=20.0, alias="REQUEST_DEADLINE_SECONDS")
 

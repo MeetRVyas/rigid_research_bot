@@ -1,6 +1,3 @@
-import os
-
-
 EMBEDDING_PROVIDER = "google"
 PROVIDER = "google"
 EMBEDDING_MODEL = "models/gemini-embedding-001"
@@ -15,30 +12,4 @@ OLLAMA_ALLOWED_EMBEDDING_MODELS=["nomic-embed-text","embeddinggemma:300m"]
 MAX_LLM_RETRIES_ON_API_LIMITS = 6
 LIMIT_HIT_RETRY_BASE_DELAY = 2
 
-keys = {}
-for name in ["GEMINI_API_KEY"] :
-    i = 1
-    while True :
-        key = os.getenv(name + str(i))
-        if key is None :
-            break
-        i += 1
-        keys.setdefault(name, []).append(key)
-
-LLM_CONFIG = {
-    "google" : {
-        "models" : [
-            # "gemini-3.5-flash",
-            "gemini-3.1-flash-lite",
-        ],
-        "keys" : keys["GEMINI_API_KEY"],
-        "base_url" : GOOGLE_BASE_URL
-    },
-    # "ollama" : {
-    #     "models" : [
-    #         "mistral:v0.3",
-    #     ],
-    #     "keys" : [],
-    #     "base_url" : OLLAMA_BASE_URL
-    # },
-}
+LLM_CONFIG_PATH = "llm_config.yaml"
