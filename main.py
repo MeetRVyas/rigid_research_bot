@@ -1,10 +1,22 @@
-import argparse
+import os
+import asyncio
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.formatted_text import HTML
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich.rule import Rule
+
+import warnings
+import logging
+
 import operator
 import re
 import time
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any, Dict, List, Optional, Tuple, TypedDict
 
 from langchain_core.documents import Document
@@ -14,9 +26,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from models import ClassifyResult, DraftAnswer, Intent, Score
 from llm_factory import build_llm, build_embeddings
-from config import LLM_CONFIG, EMBEDDING_PROVIDER, EMBEDDING_MODEL
+from config import LLM_CONFIG_PATH, EMBEDDING_PROVIDER, EMBEDDING_MODEL
 from rag_service import PdfRagService
 
 from arxiv_service import (
@@ -57,10 +72,11 @@ BYPASS_INTENTS = {
     Intent.PAPER_QA.value,
 }
 
-# "pdf_rag_search" is not in TOOL_REGISTRY on purpose — it isn't a plain
-# metadata-fetching function like the others, it needs an embedder + a FAISS
-# store. CRAG_Service._dispatch_tool_call special-cases it and routes to
-# PdfRagService instead of PaperRetriever/TOOL_REGISTRY.
+warnings.filterwarnings("ignore")
+
+# 2. Hide internal library error logs (like the [ERROR] tool call... message)
+# This forces libraries to only print CRITICAL issues, hiding standard warnings/errors
+logging.getLogger().setLevel(logging.CRITICAL)
 
 # ======================================================================
 # Graph state
@@ -68,6 +84,7 @@ BYPASS_INTENTS = {
 class State(TypedDict):
     question: str
     original_question: str
+    clarification_rounds: int
     chat_history: Annotated[List[Dict[str, str]], operator.add]
     intent: str
     intent_confidence: float
@@ -100,12 +117,13 @@ class PaperRetriever:
     def __init__(self, tool_registry: Dict[str, Any]):
         self._tool_registry = tool_registry
 
-    def retrieve(self, tool_name: str, tool_args: Dict[str, Any]) -> List[Document]:
+    async def retrieve(self, tool_name: str, tool_args: Dict[str, Any]) -> List[Document]:
         tool_fn = self._tool_registry.get(tool_name)
         if not tool_fn:
             return []
         try:
-            raw_results = tool_fn(**tool_args)
+            # Dispatch synchronous tools into background threads
+            raw_results = await asyncio.to_thread(tool_fn, **tool_args)
         except Exception as e:
             print(f"[ERROR] tool call {tool_name}({tool_args}) failed: {e}")
             return []
@@ -165,23 +183,23 @@ class RelevanceRefiner:
         ])
         self._score_chain = prompt | llm.with_structured_output(Score)
 
-    def refine(self, question: str, intent: str, docs: List[Document]) -> Tuple[List[Document], Dict[str, Dict[str, Any]], str]:
-        good_docs = self._filter_relevant(question, docs) if intent in self._filterable_intents else docs
+    async def refine(self, question: str, intent: str, docs: List[Document]) -> Tuple[List[Document], Dict[str, Dict[str, Any]], str]:
+        good_docs = await self._filter_relevant(question, docs) if intent in self._filterable_intents else docs
         sources, refined_context = self._attribute(good_docs)
         return good_docs, sources, refined_context
 
-    def _filter_relevant(self, question: str, docs: List[Document]) -> List[Document]:
+    async def _filter_relevant(self, question: str, docs: List[Document]) -> List[Document]:
         if not docs:
             return []
         good_docs: List[Document] = []
         for doc in docs:
             try:
-                res: Score = self._score_chain.invoke({"question": question, "chunk": doc.page_content})
+                res: Score = await self._score_chain.ainvoke({"question": question, "chunk": doc.page_content})
                 score = res.score
             except Exception:
                 score = 0.0
             finally:
-                time.sleep(self._sleep_between_calls)
+                await asyncio.sleep(self._sleep_between_calls)
 
             if score > self._threshold:
                 good_docs.append(doc)
@@ -207,7 +225,7 @@ class AnswerGenerator:
     def __init__(self, llm):
         self._llm = llm
 
-    def generate(self, question: str, context: str, strict: bool = False) -> str:
+    async def generate(self, question: str, context: str, strict: bool = False) -> str:
         system = (
             "You are a research assistant. Answer ONLY using the provided sources.\n"
             "Every factual claim MUST be followed by a citation marker like [1], [2].\n"
@@ -221,7 +239,7 @@ class AnswerGenerator:
             ("human", "Question: {question}\n\nSources:\n{context}"),
         ])
         chain = prompt | self._llm
-        return self._extract_text(chain.invoke({"question": question, "context": context}))
+        return self._extract_text(await chain.ainvoke({"question": question, "context": context}))
 
     @staticmethod
     def _extract_text(response) -> str:
@@ -267,12 +285,12 @@ class ContextResponder:
         ])
         self._chain = prompt | llm | StrOutputParser()
 
-    def respond(self, question: str, history: List[Dict[str, str]]) -> str:
+    async def respond(self, question: str, history: List[Dict[str, str]]) -> str:
         try:
-            return self._chain.invoke({
+            return (await self._chain.ainvoke({
                 "question": question,
                 "history": self.format_history(history, self._max_history_turns),
-            }).strip()
+            })).strip()
         except Exception:
             return "Sorry, I had trouble putting that together — could you rephrase?"
 
@@ -290,27 +308,27 @@ class ContextResponder:
 class CRAG_Service:
     LOWER_THRESHOLD = 0.3
     DRAFT_CONFIDENCE_THRESHOLD = 0.6
-    MAX_CLARIFICATION_ROUNDS = 1
+    MAX_CLARIFICATION_ROUNDS = 2
     MAX_GENERATION_ATTEMPTS = 2
     DEFAULT_CATEGORY = "cs.AI"
     DEFAULT_RECENT_DAYS = 7
     HISTORY_WINDOW = 6
 
-    def __init__(self, session_id: str, model_name: str, provider: str = "ollama", api_keys: dict = None):
+    def __init__(self, session_id: str, api_keys: dict = None):
         self.session_id = session_id
         self.api_keys = api_keys or {}
         
         # Standalone checkpointer for the CLI
         self.checkpointer = MemorySaver()
 
-        self.llm = build_llm(LLM_CONFIG)
+        self.llm = build_llm(LLM_CONFIG_PATH)
         self._retriever = PaperRetriever(TOOL_REGISTRY)
         self._refiner = RelevanceRefiner(self.llm, threshold=self.LOWER_THRESHOLD)
         self._generator = AnswerGenerator(self.llm)
         self._verifier = CitationVerifier()
         self._context_responder = ContextResponder(self.llm, max_history_turns=self.HISTORY_WINDOW)
         self._pdf_rag = PdfRagService(
-            embeddings=build_embeddings(EMBEDDING_PROVIDER, EMBEDDING_MODEL, self.api_keys),
+            embeddings=build_embeddings(EMBEDDING_PROVIDER, EMBEDDING_MODEL),
         )
 
         self.app = self._build_graph()
@@ -337,10 +355,10 @@ class CRAG_Service:
         workflow.add_node("finalize", self.finalize)
 
         workflow.add_edge(START, "classify")
-        workflow.add_conditional_edges("classify", self._route_after_classify, {"build_query": "build_query", "clarify": "clarify", "context_reply": "context_reply"})
+        workflow.add_conditional_edges("classify", self._route_after_classify, {"build_query": "build_query", "clarify": "clarify", "context_reply": "context_reply", "no_results": "no_results"})
         workflow.add_edge("clarify", "draft_answer")
         workflow.add_edge("draft_answer", "context_hint")
-        workflow.add_conditional_edges("context_hint", self._route_after_context_hint, {"build_query": "build_query", "finalize_from_draft": "finalize_from_draft"})
+        workflow.add_conditional_edges("context_hint", self._route_after_context_hint, {"classify": "classify", "finalize_from_draft": "finalize_from_draft"})
         workflow.add_edge("build_query", "retrieve")
         workflow.add_edge("retrieve", "refine")
         workflow.add_conditional_edges("refine", self._route_after_refine, {"generate": "generate", "no_results": "no_results"})
@@ -361,10 +379,15 @@ class CRAG_Service:
         # construction, a compound-but-structured request rather than an
         # ambiguous one — skip the clarify/draft-answer detour for it too.
         if intent in BYPASS_INTENTS or len(state.get("actions", [])) > 1: return "build_query"
-        return "clarify"
+        if state["clarification_rounds"] < self.MAX_CLARIFICATION_ROUNDS :
+            return "clarify"
+        return "no_results"
 
     def _route_after_context_hint(self, state: State) -> str:
-        return "finalize_from_draft" if state.get("context_hint") == "confident_draft" else "build_query"
+        if state.get("context_hint") == "confident_draft" :
+            return "finalize_from_draft"
+        else :
+            return "classify"
 
     def _route_after_refine(self, state: State) -> str:
         return "generate" if state.get("refined_context", "").strip() else "no_results"
@@ -374,15 +397,15 @@ class CRAG_Service:
             return "finalize"
         return "generate"
 
-    def run(self, question: Optional[str] = None, resume_answer: Optional[str] = None, thread_id: Optional[str] = None) -> dict:
+    async def run(self, question: Optional[str] = None, resume_answer: Optional[str] = None, thread_id: Optional[str] = None) -> dict:
         config = {"configurable": {"thread_id": thread_id or self.session_id}}
         try:
             if resume_answer is not None:
-                result = self.app.invoke(Command(resume=resume_answer), config=config)
+                result = await self.app.ainvoke(Command(resume=resume_answer), config=config)
             else:
                 if not question:
                     raise ValueError("`question` is required unless resuming.")
-                result = self.app.invoke({
+                result = await self.app.ainvoke({
                     "question": question,
                     "original_question": question,
                     "intent": "", "intent_confidence": 0.0, "ambiguous": False, "actions": [],
@@ -403,27 +426,41 @@ class CRAG_Service:
             raise RuntimeError(f"Pipeline crashed: {e}")
 
     # --- Nodes ---
-    def classify(self, state: State) -> Dict[str, Any]:
+    async def classify(self, state: State) -> Dict[str, Any]:
         self._push_status("classify", "Classifying your question…")
         history = ContextResponder.format_history(state.get("chat_history", []), self.HISTORY_WINDOW)
         prompt = ChatPromptTemplate.from_messages([
             ("system",
-             "You are a router for a paper-research assistant. Classify the PRIMARY intent into: "
-             "GENERAL_CHAT, AUTHOR_LOOKUP, RECENT_DIGEST, CITATION_GRAPH, PAPER_LOOKUP, PAPER_QA, or OPEN_ENDED.\n"
-             "- PAPER_LOOKUP: the user wants a paper's metadata, abstract, or PDF link — the abstract is enough.\n"
-             "- PAPER_QA: the user wants something only the paper's FULL TEXT can answer — a method, a result, "
-             "a specific section, a number that isn't in the abstract. Set paper_ids to the arXiv id(s) (or "
-             "[\"all\"] to search every paper already indexed this session) and query to a focused search "
-             "string describing what to find inside the text.\n"
-             "If the question has more than one independent part, put the main part in the primary "
-             "intent/slots and every OTHER part as its own entry in additional_actions (same fields, its own "
-             "intent) — e.g. a full-text question about one paper plus a separate recent-papers digest.\n"
-             "Extract slots for the primary intent. Do NOT return schema. Do NOT explain."),
+            "You are an expert routing assistant for a scientific paper-research tool. "
+            "Your job is to classify the user's PRIMARY intent into exactly one of the following categories.\n\n"
+            
+            "CATEGORIES:\n"
+            "- PAPER_LOOKUP: The user asks for high-level metadata (abstract, authors, publication date, or PDF link) for specific papers.\n"
+            "- PAPER_QA: The user asks about the internal content, methodology, results, or specific details of one or more papers. "
+            "**This includes comparing specific papers.** Require this if answering needs the FULL TEXT. "
+            "Extract slots: `paper_ids` (list of arXiv IDs, or [\"all\"] to search all session papers) and `query` (focused search string of what to find inside the text).\n"
+            "- AUTHOR_LOOKUP: The user wants to find papers written by a specific named person.\n"
+            "- RECENT_DIGEST: The user asks for new, recent, or latest developments in a specific category or time window.\n"
+            "- CITATION_GRAPH: The user asks what a specific paper cites (references) or what cites it (forward citations).\n"
+            "- GENERAL_CHAT: Casual conversation, greetings, or questions that do NOT require searching the paper database at all.\n"
+            "- OPEN_ENDED: STRICT FALLBACK. Use ONLY for extremely broad, thematic literature queries that lack specific papers, authors, or timeframes. "
+            "If the user mentions a specific paper, method, or author, DO NOT USE THIS.\n\n"
+            
+            "MULTI-PART QUESTIONS:\n"
+            "If the query has multiple independent parts, assign the main part to the primary intent and slots. "
+            "Put every OTHER independent part as its own entry in `additional_actions` (with its own intent and slots). "
+            "Example: A full-text question about one paper (PAPER_QA) plus a separate request for recent papers (RECENT_DIGEST).\n\n"
+            
+            "CRITICAL RULES:\n"
+            "1. Never classify as OPEN_ENDED if the user names a paper, an author, or asks for recent papers.\n"
+            "2. If the user asks to compare papers, use PAPER_QA.\n"
+            "3. Extract slots for the primary intent. Do NOT return schema. Do NOT explain your reasoning."
+            ),
             ("human", "Conversation so far:\n{history}\n\nQuestion: {question}"),
         ])
         chain = prompt | self.llm.with_structured_output(ClassifyResult)
         try:
-            res: ClassifyResult = chain.invoke({"question": state["question"], "history": history})
+            res: ClassifyResult = await chain.ainvoke({"question": state["question"], "history": history})
         except Exception:
             res = ClassifyResult(intent=Intent.OPEN_ENDED, confidence=0.0, ambiguous=True)
 
@@ -446,19 +483,19 @@ class CRAG_Service:
             "actions": actions,
         }
 
-    def clarify(self, state: State) -> Dict[str, Any]:
+    async def clarify(self, state: State) -> Dict[str, Any]:
         rounds = state.get("clarification_rounds", 0)
         if not state.get("ambiguous") or rounds >= self.MAX_CLARIFICATION_ROUNDS:
             return {}
         self._push_status("clarify", "Question needs clarification…")
-        clarifying_question = self._generate_clarifying_question(state)
+        clarifying_question = await self._generate_clarifying_question(state)
         answer = interrupt({"question": clarifying_question})
         return {
             "clarification_answer": answer, "clarification_rounds": rounds + 1,
             "question": f"{state['question']}\n\nAdditional context from user: {answer}",
         }
 
-    def draft_answer(self, state: State) -> Dict[str, Any]:
+    async def draft_answer(self, state: State) -> Dict[str, Any]:
         self._push_status("draft_answer", "Drafting a preliminary answer…")
         history = ContextResponder.format_history(state.get("chat_history", []), self.HISTORY_WINDOW)
         prompt = ChatPromptTemplate.from_messages([
@@ -467,36 +504,40 @@ class CRAG_Service:
         ])
         chain = prompt | self.llm.with_structured_output(DraftAnswer)
         try:
-            res: DraftAnswer = chain.invoke({"question": state["question"], "history": history})
+            res: DraftAnswer = await chain.ainvoke({"question": state["question"], "history": history})
         except Exception:
             res = DraftAnswer(answer="", confidence=0.0)
         return {"draft_answer": res.answer, "draft_confidence": res.confidence}
 
-    def context_hint(self, state: State) -> Dict[str, Any]:
+    async def context_hint(self, state: State) -> Dict[str, Any]:
         hint = "confident_draft" if state.get("draft_confidence", 0.0) >= self.DRAFT_CONFIDENCE_THRESHOLD else "web_primed"
         self._push_status("context_hint", f"Context assessment: {hint}")
         return {"context_hint": hint}
 
-    def context_reply(self, state: State) -> Dict[str, Any]:
+    async def context_reply(self, state: State) -> Dict[str, Any]:
         self._push_status("context_reply", "Answering from conversation context…")
-        answer = self._context_responder.respond(state["question"], state.get("chat_history", []))
+        answer = await self._context_responder.respond(state["question"], state.get("chat_history", []))
         return {"answer": answer, "verified": True, "verification_notes": "No search performed.", "answered_from_context": True, **self._history_delta(state, answer)}
 
-    def finalize_from_draft(self, state: State) -> Dict[str, Any]:
+    async def finalize_from_draft(self, state: State) -> Dict[str, Any]:
         self._push_status("finalize_from_draft", "Answering from what I already know…")
         answer = state.get("draft_answer") or "I don't have a confident answer. Searching needed."
         return {"answer": answer, "verified": True, "verification_notes": "Draft used.", "answered_from_context": True, **self._history_delta(state, answer)}
 
-    def build_query(self, state: State) -> Dict[str, Any]:
+    async def build_query(self, state: State) -> Dict[str, Any]:
         actions = state.get("actions") or [{"intent": state["intent"]}]
         self._push_status("build_query", f"Selecting tool{'s' if len(actions) > 1 else ''}…")
-        tool_calls = [self._action_to_tool_call(state, action) for action in actions]
+        
+        tool_calls = []
+        for action in actions:
+            tool_calls.append(await self._action_to_tool_call(state, action))
+            
         search_query = next(
             (c["tool_args"].get("query") for c in tool_calls if c.get("tool_args", {}).get("query")), ""
         )
         return {"tool_calls": tool_calls, "search_query": search_query}
 
-    def _action_to_tool_call(self, state: State, action: Dict[str, Any]) -> Dict[str, Any]:
+    async def _action_to_tool_call(self, state: State, action: Dict[str, Any]) -> Dict[str, Any]:
         intent = action.get("intent")
         if intent == Intent.AUTHOR_LOOKUP.value:
             return {"tool_name": "get_author_papers", "tool_args": {"author": action.get("author_name") or state["question"]}}
@@ -510,64 +551,64 @@ class CRAG_Service:
             return {"tool_name": tool_name, "tool_args": {"paper_id": action.get("paper_id")}}
         if intent == Intent.PAPER_QA.value:
             paper_ids = action.get("paper_ids") or ([action["paper_id"]] if action.get("paper_id") else ["all"])
-            query = action.get("query") or self._rewrite_pdf_query(state)
+            query = action.get("query") or await self._rewrite_pdf_query(state)
             return {"tool_name": "pdf_rag_search", "tool_args": {"paper_ids": paper_ids, "query": query}}
-        query = action.get("query") or self._rewrite_query(state)
+        query = action.get("query") or await self._rewrite_query(state)
         return {"tool_name": "search_semantic_scholar", "tool_args": {"query": query}}
 
-    def retrieve(self, state: State) -> Dict[str, Any]:
+    async def retrieve(self, state: State) -> Dict[str, Any]:
         tool_calls = state.get("tool_calls") or []
         self._push_status("retrieve", f"Fetching from {len(tool_calls)} source(s)…" if len(tool_calls) != 1 else "Fetching papers…")
 
         if len(tool_calls) <= 1:
-            docs = self._dispatch_tool_call(tool_calls[0]) if tool_calls else []
+            docs = await self._dispatch_tool_call(tool_calls[0]) if tool_calls else []
         else:
             # Independent, I/O-bound calls (HTTP lookups and/or PDF download +
             # indexing) — run them concurrently so one slow PAPER_QA action
             # doesn't serialize behind the others. Each call is isolated so
             # one failure doesn't drop the rest of the results.
             docs = []
-            with ThreadPoolExecutor(max_workers=min(4, len(tool_calls))) as pool:
-                futures = [pool.submit(self._dispatch_tool_call, call) for call in tool_calls]
-                for future in futures:
-                    try:
-                        docs.extend(future.result())
-                    except Exception as e:
-                        print(f"[ERROR] retrieval action failed: {e}")
+            results = await asyncio.gather(*(self._dispatch_tool_call(call) for call in tool_calls), return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    print(f"[ERROR] retrieval action failed: {res}")
+                else:
+                    docs.extend(res)
         return {"raw_docs": docs}
 
-    def _dispatch_tool_call(self, call: Dict[str, Any]) -> List[Document]:
+    async def _dispatch_tool_call(self, call: Dict[str, Any]) -> List[Document]:
         tool_name, tool_args = call.get("tool_name", ""), call.get("tool_args", {}) or {}
         if tool_name == "pdf_rag_search":
-            return self._pdf_rag.retrieve(
+            return await asyncio.to_thread(
+                self._pdf_rag.retrieve,
                 paper_ids=tool_args.get("paper_ids") or ["all"],
                 query=tool_args.get("query", ""),
                 on_status=self._push_status,
             )
-        return self._retriever.retrieve(tool_name, tool_args)
+        return await self._retriever.retrieve(tool_name, tool_args)
 
-    def refine(self, state: State) -> Dict[str, Any]:
+    async def refine(self, state: State) -> Dict[str, Any]:
         self._push_status("refine", "Filtering and attributing sources…")
-        good_docs, sources, refined_context = self._refiner.refine(state["question"], state["intent"], state.get("raw_docs", []))
+        good_docs, sources, refined_context = await self._refiner.refine(state["question"], state["intent"], state.get("raw_docs", []))
         return {"good_docs": good_docs, "sources": sources, "refined_context": refined_context}
 
-    def no_results(self, state: State) -> Dict[str, Any]:
+    async def no_results(self, state: State) -> Dict[str, Any]:
         self._push_status("no_results", "No relevant papers found…")
         answer = "I couldn't find enough relevant papers to answer this question."
         return {"answer": answer, "verified": False, "verification_notes": "no context retrieved", "answered_from_context": False, **self._history_delta(state, answer)}
 
-    def generate(self, state: State) -> Dict[str, Any]:
+    async def generate(self, state: State) -> Dict[str, Any]:
         self._push_status("generate", "Generating your answer…")
         attempts = state.get("generation_attempts", 0)
-        text = self._generator.generate(state["question"], state.get("refined_context", ""), strict=(attempts > 0))
+        text = await self._generator.generate(state["question"], state.get("refined_context", ""), strict=(attempts > 0))
         return {"generated_answer": text, "generation_attempts": attempts + 1}
 
-    def verify(self, state: State) -> Dict[str, Any]:
+    async def verify(self, state: State) -> Dict[str, Any]:
         self._push_status("verify", "Checking citations…")
         verified, notes = self._verifier.verify(state.get("generated_answer", ""), state.get("sources", {}))
         return {"verified": verified, "verification_notes": notes}
 
-    def finalize(self, state: State) -> Dict[str, Any]:
+    async def finalize(self, state: State) -> Dict[str, Any]:
         self._push_status("finalize", "Finalizing your answer…")
         answer = state.get("generated_answer", "")
         if sources := state.get("sources", {}):
@@ -578,21 +619,21 @@ class CRAG_Service:
     def _history_delta(self, state: State, final_answer: str) -> Dict[str, Any]:
         return {"chat_history": [{"role": "user", "content": state.get("original_question") or state["question"]}, {"role": "assistant", "content": final_answer}]}
 
-    def _generate_clarifying_question(self, state: State) -> str:
+    async def _generate_clarifying_question(self, state: State) -> str:
         chain = ChatPromptTemplate.from_messages([("system", "Ask ONE specific clarifying question. Do not answer."), ("human", "Question: {question}")]) | self.llm | StrOutputParser()
         try:
-            return chain.invoke({"question": state["question"]}).strip()
+            return (await chain.ainvoke({"question": state["question"]})).strip()
         except Exception:
             return "Could you clarify what specifically you'd like to know?"
 
-    def _rewrite_query(self, state: State) -> str:
+    async def _rewrite_query(self, state: State) -> str:
         chain = ChatPromptTemplate.from_messages([("system", "Rewrite into a concise 6-14 word search query. Do NOT answer."), ("human", "Question: {question}")]) | self.llm | StrOutputParser()
         try:
-            return chain.invoke({"question": state["question"]}).strip()
+            return (await chain.ainvoke({"question": state["question"]})).strip()
         except Exception:
             return state["question"]
 
-    def _rewrite_pdf_query(self, state: State) -> str:
+    async def _rewrite_pdf_query(self, state: State) -> str:
         """Fallback for PAPER_QA when classify() didn't already fill in a
         focused `query` — rewrites the question into a search string aimed at
         the paper's full text rather than at ArXiv/Semantic Scholar."""
@@ -601,7 +642,7 @@ class CRAG_Service:
             ("human", "Question: {question}"),
         ]) | self.llm | StrOutputParser()
         try:
-            return chain.invoke({"question": state["question"]}).strip()
+            return (await chain.ainvoke({"question": state["question"]})).strip()
         except Exception:
             return state["question"]
 
@@ -609,51 +650,83 @@ class CRAG_Service:
 # ======================================================================
 # Main CLI Loop
 # ======================================================================
-def main():
-    parser = argparse.ArgumentParser(description="Standalone CLI for CRAG ArXiv/Semantic-Scholar Research Assistant")
-    parser.add_argument("--model", type=str, default="llama3", help="Model name to use (e.g., llama3, gpt-4o)")
-    parser.add_argument("--provider", type=str, default="ollama", help="LLM Provider (e.g., ollama, openai, anthropic)")
-    args = parser.parse_args()
-
+async def main():
     session_id = str(uuid.uuid4())
-    print("=" * 60)
-    print(f"🚀 Starting CLI RAG Session (ID: {session_id})")
-    print(f"🧠 Provider: {args.provider.upper()} | Model: {args.model}")
-    print("💡 Type 'exit' or 'quit' to stop.")
-    print("=" * 60)
+    console = Console()
 
-    service = CRAG_Service(
-        session_id=session_id,
-        model_name=args.model,
-        provider=args.provider
+    # Chatbot Welcome Screen
+    welcome_text = (
+        "Hello! I am your AI Assistant. I can search documents and answer questions.\n"
+        "💡 Press [bold green]Enter[/bold green] to send.\n"
+        "💡 Type [bold red]'exit'[/bold red] or press [bold red]Ctrl+D[/bold red] to stop."
     )
+    console.print(Panel(welcome_text, title=f"🤖 RAG Agent (Session: {session_id[:8]})", border_style="cyan"))
+
+    history_file = os.path.join(os.path.expanduser("~"), ".crag_cli_history")
+    session = PromptSession(history=FileHistory(history_file))
+
+    service = CRAG_Service(session_id=session_id)
 
     while True:
         try:
-            user_input = input("\n🧑 User: ").strip()
+            console.print(Rule(style="dim default"))
+            
+            user_input = (await session.prompt_async(HTML("\n<b><ansigreen>🧑 You: </ansigreen></b>"))).strip()
+            
             if not user_input:
                 continue
             if user_input.lower() in ["exit", "quit"]:
                 break
 
-            result = service.run(question=user_input)
+            with console.status("[bold cyan]Agent is thinking...", spinner="bouncingBar"):
+                result = await service.run(question=user_input)
 
             while result.get("status") == "needs_clarification":
-                clarification = input(f"\n🤖 Assistant: {result['question']}\n\n🧑 Clarify: ").strip()
+                console.print(f"\n[bold yellow]🤖 Assistant:[/bold yellow] {result['question']}")
+                
+                clarification_msg = HTML("<b><ansiyellow>💬 Clarify: </ansiyellow></b>")
+                clarification = (await session.prompt_async(clarification_msg)).strip()
+                
                 if clarification.lower() in ["exit", "quit"]:
-                    print("Goodbye!")
+                    console.print("\n[bold cyan]👋 Goodbye![/bold cyan]")
                     return
-                result = service.run(resume_answer=clarification)
+                
+                with console.status("[bold cyan]Re-evaluating context...", spinner="bouncingBar"):
+                    result = await service.run(resume_answer=clarification)
 
             if result.get("status") == "complete":
-                print(f"\n🤖 Assistant:\n{result.get('answer')}")
+                console.print("\n[bold cyan]🤖 Assistant:[/bold cyan]")
+                md_answer = Markdown(result.get('answer'))
+                console.print(md_answer)
+                console.print()
 
         except KeyboardInterrupt:
+            console.print("\n[dim yellow](Press Ctrl+D or type 'exit' to quit)[/dim yellow]")
+            continue
+        except EOFError:
             break
         except Exception as e:
-            print(f"\n❌ [Error] {e}")
+            # 3. Graceful Error Handling
+            error_msg = str(e)
+            
+            # Check if it's the specific Semantic Scholar Rate Limit error
+            if "429" in error_msg and "Semantic Scholar" in error_msg:
+                console.print(
+                    "\n[bold orange3]⏳ Rate Limit Reached:[/bold orange3] "
+                    "Semantic Scholar is receiving too many requests right now. "
+                    "Please wait a few seconds and try your question again."
+                )
+            # Generic fallback for other tool failures
+            elif "tool call" in error_msg.lower() or "failed" in error_msg.lower():
+                console.print(
+                    "\n[bold yellow]⚠️ Search Service Issue:[/bold yellow] "
+                    "One of the background tools had trouble executing. Please try rephrasing your query."
+                )
+            # Completely unexpected errors
+            else:
+                console.print(f"\n[bold red]❌ Unexpected Error:[/bold red] {error_msg}")
 
-    print("\n👋 Goodbye!")
+    console.print("\n[bold cyan]👋 Session ended. Goodbye![/bold cyan]")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
