@@ -29,7 +29,7 @@ from langgraph.types import Command, interrupt
 from dotenv import load_dotenv
 load_dotenv()
 
-from models import ClassifyResult, DraftAnswer, Intent, Score
+from models import ClassifyResult, CitationSupport, DraftAnswer, Intent, Score
 from llm_factory import build_llm, build_embeddings
 from config import LLM_CONFIG_PATH, EMBEDDING_PROVIDER, EMBEDDING_MODEL
 from rag_service import PdfRagService
@@ -139,6 +139,7 @@ class State(TypedDict):
     good_docs: List[Document]
     sources: Dict[str, Dict[str, Any]]
     refined_context: str
+    per_paper_answers: List[Dict[str, Any]] # Map-reduce PAPER_QA (multi-paper comparisons)
     generated_answer: str
     generation_attempts: int
     verified: bool
@@ -237,10 +238,18 @@ class PaperRetriever:
 
 
 class RelevanceRefiner:
-    def __init__(self, llm, threshold: float = 0.3, filterable_intents: Optional[set] = None, sleep_between_calls: float = 1.0):
+    def __init__(
+        self,
+        llm,
+        threshold: float = 0.3,
+        filterable_intents: Optional[set] = None,
+        sleep_between_calls: float = 1.0,
+        max_docs: Optional[int] = None,
+    ):
         self._threshold = threshold
         self._filterable_intents = filterable_intents or {Intent.OPEN_ENDED.value}
         self._sleep_between_calls = sleep_between_calls
+        self._max_docs = max_docs
 
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a STRICT retrieval evaluator for a scientific paper-search RAG pipeline.
@@ -260,14 +269,17 @@ RULES:
         self._score_chain = prompt | llm.with_structured_output(Score)
 
     async def refine(self, question: str, intent: str, docs: List[Document]) -> Tuple[List[Document], Dict[str, Dict[str, Any]], str]:
-        good_docs = await self._filter_relevant(question, docs) if intent in self._filterable_intents else docs
+        good_docs = await self._filter_relevant(question, docs) if intent in self._filterable_intents else list(docs)
+        # Scored docs arrive already sorted best-first.
+        if self._max_docs is not None and len(good_docs) > self._max_docs:
+            good_docs = good_docs[: self._max_docs]
         sources, refined_context = self._attribute(good_docs)
         return good_docs, sources, refined_context
 
     async def _filter_relevant(self, question: str, docs: List[Document]) -> List[Document]:
         if not docs:
             return []
-        good_docs: List[Document] = []
+        scored: List[Tuple[Document, float]] = []
         for doc in docs:
             try:
                 res: Score = await self._score_chain.ainvoke({"question": question, "chunk": doc.page_content})
@@ -279,8 +291,10 @@ RULES:
                 await asyncio.sleep(self._sleep_between_calls)
 
             if score > self._threshold:
-                good_docs.append(doc)
-        return good_docs
+                scored.append((doc, score))
+
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        return [doc for doc, _ in scored]
 
     @staticmethod
     def _attribute(docs: List[Document]) -> Tuple[Dict[str, Dict[str, Any]], str]:
@@ -293,6 +307,7 @@ RULES:
                 "url": doc.metadata.get("url", ""),
                 "authors": doc.metadata.get("authors", ""),
                 "paper_id": doc.metadata.get("paper_id", ""),
+                "content": doc.page_content,
             }
             lines.append(f"[{label}] {doc.page_content}")
         return sources, "\n\n".join(lines)
@@ -334,9 +349,28 @@ class AnswerGenerator:
 
 
 class CitationVerifier:
-    @staticmethod
-    def verify(answer: str, sources: Dict[str, Dict[str, Any]]) -> Tuple[bool, str]:
-        used = set(re.findall(r"\[(\d+)\]", answer))
+    _MARKER_RE = re.compile(r"\[(\d+)\]")
+    _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+    def __init__(self, llm, max_concurrency: int = 3):
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a STRICT fact-checker for a citation-verification pipeline.
+You will be given a CLAIM taken from a generated answer, and the SOURCE text that the answer cited immediately after that claim.
+
+Determine whether the SOURCE factually supports the CLAIM.
+
+RULES:
+1. Be strict: topical overlap or a merely related subject does NOT count as support.
+2. The SOURCE does not need to state the claim word-for-word, but the specific fact/number/conclusion in the CLAIM must be traceable to the SOURCE.
+3. If the CLAIM is a general statement not really asserting anything checkable (e.g. a transition sentence), treat it as supported."""),
+            ("human", "CLAIM: {claim}\n\nSOURCE:\n{source_text}"),
+        ])
+        self._support_chain = prompt | llm.with_structured_output(CitationSupport)
+
+    async def verify(self, answer: str, sources: Dict[str, Dict[str, Any]]) -> Tuple[bool, str]:
+        used = set(self._MARKER_RE.findall(answer))
         valid = set(sources.keys())
         invalid = used - valid
 
@@ -344,7 +378,59 @@ class CitationVerifier:
             return False, f"Unverified citation marker(s): {sorted(invalid)}"
         if not used and sources:
             return False, "Answer cites no sources despite sources being available."
+        if not sources:
+            return True, "No sources to verify against."
+
+        unsupported = await self._check_semantic_support(answer, sources)
+        if unsupported:
+            return False, f"Claim(s) not factually supported by their cited source(s): {sorted(unsupported)}"
         return True, "All citations verified against retrieved sources."
+
+    async def _check_single_claim(self, label: str, claim: str, source_text: str) -> Tuple[str, bool]:
+        async with self._semaphore:
+            try:
+                res: CitationSupport = await self._support_chain.ainvoke({"claim": claim, "source_text": source_text})
+                return label, res.supported
+            except Exception as e:
+                error_logger.error(f"Error during semantic citation check: {e}", exc_info=True)
+                # Fail open on infra errors (LLM outage/rate limit)
+                return label, True 
+
+    async def _check_semantic_support(self, answer: str, sources: Dict[str, Dict[str, Any]]) -> List[str]:
+        tasks = []
+        for label, claim in self._extract_claims(answer):
+            source_text = sources.get(label, {}).get("content") or sources.get(label, {}).get("title", "")
+
+            if source_text:
+                tasks.append(self._check_single_claim(label, claim, source_text))
+            
+            results = await asyncio.gather(*tasks)
+
+            unsupported: List[str] = []
+            for label, supported in results:
+                if not supported and label not in unsupported:
+                    unsupported.append(label)
+        
+        return unsupported
+
+    @classmethod
+    def _extract_claims(cls, answer: str) -> List[Tuple[str, str]]:
+        """Pairs each citation marker with the sentence immediately before
+        it — a best-effort proxy for 'the claim right before the marker'.
+        Adjacent markers (e.g. "...finding [1][2].") share the same
+        preceding sentence, since both are citing it."""
+        claims: List[Tuple[str, str]] = []
+        cursor = 0
+        last_sentence = ""
+        for match in cls._MARKER_RE.finditer(answer):
+            segment = answer[cursor:match.start()]
+            sentences = [s for s in cls._SENTENCE_SPLIT_RE.split(segment) if s.strip()]
+            if sentences:
+                last_sentence = sentences[-1].strip()
+            if last_sentence:
+                claims.append((match.group(1), last_sentence))
+            cursor = match.end()
+        return claims
 
 
 class ReferenceFormatter:
@@ -403,6 +489,11 @@ class CRAG_Service:
     DEFAULT_CATEGORY = "cs.AI"
     DEFAULT_RECENT_DAYS = 7
     HISTORY_WINDOW = 6
+    MAX_CONTEXT_DOCS = 8 # Chunks/papers kept per answer after relevance filtering
+
+    # Intents whose retrieved docs are large/noisy enough to need semantic
+    # filtering before they reach `generate`
+    FILTERABLE_INTENTS = {Intent.OPEN_ENDED.value, Intent.PAPER_QA.value, Intent.RECENT_DIGEST.value}
 
     def __init__(self, session_id: str, api_keys: dict = None):
         self.session_id = session_id
@@ -413,9 +504,14 @@ class CRAG_Service:
 
         self.llm = build_llm(LLM_CONFIG_PATH)
         self._retriever = PaperRetriever(TOOL_REGISTRY)
-        self._refiner = RelevanceRefiner(self.llm, threshold=self.LOWER_THRESHOLD)
+        self._refiner = RelevanceRefiner(
+            self.llm,
+            threshold=self.LOWER_THRESHOLD,
+            filterable_intents=self.FILTERABLE_INTENTS,
+            max_docs=self.MAX_CONTEXT_DOCS,
+        )
         self._generator = AnswerGenerator(self.llm)
-        self._verifier = CitationVerifier()
+        self._verifier = CitationVerifier(self.llm)
         self._context_responder = ContextResponder(self.llm, max_history_turns=self.HISTORY_WINDOW)
         self._pdf_rag = PdfRagService(
             embeddings=build_embeddings(EMBEDDING_PROVIDER, EMBEDDING_MODEL),
@@ -440,12 +536,14 @@ class CRAG_Service:
         workflow.add_node("retrieve", self.retrieve)
         workflow.add_node("refine", self.refine)
         workflow.add_node("no_results", self.no_results)
+        workflow.add_node("paper_qa_map_reduce", self.paper_qa_map_reduce)
+        workflow.add_node("synthesize_comparison", self.synthesize_comparison)
         workflow.add_node("generate", self.generate)
         workflow.add_node("verify", self.verify)
         workflow.add_node("finalize", self.finalize)
 
         workflow.add_edge(START, "classify")
-        workflow.add_conditional_edges("classify", self._route_after_classify, {"clarify": "clarify", "context_reply": "context_reply", "build_query": "build_query", "draft_answer": "draft_answer", "no_results": "no_results"})
+        workflow.add_conditional_edges("classify", self._route_after_classify, {"clarify": "clarify", "context_reply": "context_reply", "build_query": "build_query", "draft_answer": "draft_answer", "no_results": "no_results", "paper_qa_map_reduce": "paper_qa_map_reduce"})
         workflow.add_edge("clarify", "classify")
 
         workflow.add_edge("draft_answer", "context_hint")
@@ -454,6 +552,10 @@ class CRAG_Service:
         workflow.add_edge("build_query", "retrieve")
         workflow.add_edge("retrieve", "refine")
         workflow.add_conditional_edges("refine", self._route_after_refine, {"generate": "generate", "no_results": "no_results"})
+
+        # Map-reduce path for multi-paper PAPER_QA comparisons
+        workflow.add_conditional_edges("paper_qa_map_reduce", self._route_after_map_reduce, {"synthesize_comparison": "synthesize_comparison", "no_results": "no_results"})
+        workflow.add_edge("synthesize_comparison", "verify")
 
         workflow.add_edge("generate", "verify")
         workflow.add_conditional_edges("verify", self._route_after_verify, {"generate": "generate", "finalize": "finalize"})
@@ -477,11 +579,15 @@ class CRAG_Service:
                 return "clarify"
             else:
                 return "no_results"
-        
-        # 3. If it's clear and specific, go straight to tools
+
+        # 3. Multi-paper PAPER_QA comparisons
+        if self._find_multi_paper_qa_action(state):
+            return "paper_qa_map_reduce"
+
+        # 4. If it's clear and specific, go straight to tools
         if intent in BYPASS_INTENTS or len(state.get("actions", [])) > 1: return "build_query"
 
-        # 4. If it's clear but OPEN_ENDED, check if the LLM knows it already (CRAG)
+        # 5. If it's clear but OPEN_ENDED, check if the LLM knows it already (CRAG)
         return "draft_answer"
 
     def _route_after_context_hint(self, state: State) -> str:
@@ -493,6 +599,33 @@ class CRAG_Service:
 
     def _route_after_refine(self, state: State) -> str:
         return "generate" if state.get("refined_context", "").strip() else "no_results"
+
+    def _route_after_map_reduce(self, state: State) -> str:
+        return "synthesize_comparison" if state.get("per_paper_answers") else "no_results"
+
+    @staticmethod
+    def _find_multi_paper_qa_action(state: State) -> Dict[str, Any]:
+        """Returns the PAPER_QA action naming more than one explicit paper
+        (not the ["all"] session-wide search) when it is the ONLY action for
+        this question — i.e. a standalone multi-paper comparison, not one
+        branch of a larger multi-part question. A compound question like
+        "compare paper A and B, and also find recent AI papers" still goes
+        through the standard build_query fan-out unchanged: folding
+        map-reduce into that concurrent multi-tool-call path too is out of
+        scope here, since it'd mean merging map-reduce's per-paper answers
+        back into a single refine/generate pass alongside the other
+        action's docs — a bigger restructuring than requested."""
+        actions = state.get("actions") or []
+        if len(actions) != 1:
+            return {}
+        action = actions[0]
+        if action.get("intent") != Intent.PAPER_QA.value:
+            return {}
+        paper_ids = action.get("paper_ids") or []
+        normalized = [str(pid).strip().lower() for pid in paper_ids]
+        if len(paper_ids) > 1 and "all" not in normalized:
+            return action
+        return {}
 
     def _route_after_verify(self, state: State) -> str:
         if state.get("verified") or state.get("generation_attempts", 0) >= self.MAX_GENERATION_ATTEMPTS:
@@ -514,6 +647,7 @@ class CRAG_Service:
                     "clarification_rounds": 0, "clarification_answer": "", "draft_answer": "", "draft_confidence": 0.0,
                     "context_hint": "", "tool_calls": [], "search_query": "",
                     "raw_docs": [], "good_docs": [], "sources": {}, "refined_context": "",
+                    "per_paper_answers": [],
                     "generated_answer": "", "generation_attempts": 0, "answer": "",
                     "verified": False, "verification_notes": "", "answered_from_context": False,
                 }, config=config)
@@ -708,6 +842,94 @@ CONFIDENCE RUBRIC:
         good_docs, sources, refined_context = await self._refiner.refine(state["question"], state["intent"], state.get("raw_docs", []))
         return {"good_docs": good_docs, "sources": sources, "refined_context": refined_context}
 
+    async def paper_qa_map_reduce(self, state: State) -> Dict[str, Any]:
+        """Map step for a multi-paper PAPER_QA comparison: retrieve, filter,
+        and generate an independent answer for each requested paper in
+        parallel, so no single `generate` call ever has to hold more than
+        one paper's full text at once. Each paper's answer becomes one
+        citable "source" for the reduce step (synthesize_comparison)."""
+        action = self._find_multi_paper_qa_action(state)
+        paper_ids = action.get("paper_ids") or []
+        query = action.get("query") or state["question"]
+        self._push_status("paper_qa_map", f"Researching {len(paper_ids)} papers independently…")
+
+        map_prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert research assistant. Your task is to extract information from the provided paper context that is relevant to the user's query.\n"
+                       "CRITICAL: If the user query asks to compare this paper with another, DO NOT complain that the other paper is missing. Just extract the facts, methodologies, or findings about THIS paper so they can be compared later.\n"
+                       "Be concise, highly factual, and do NOT use citation markers."),
+            ("human", "User Query: {query}\n\nPaper Context:\n{context}")
+        ])
+        map_chain = map_prompt | self.llm | StrOutputParser()
+
+        async def _answer_for_paper(paper_id: str) -> Optional[Dict[str, Any]]:
+            docs = await asyncio.to_thread(
+                self._pdf_rag.retrieve,
+                paper_ids=[paper_id],
+                query=query,
+                on_status=self._push_status,
+            )
+            good_docs, sources, refined_context = await self._refiner.refine(
+                query, Intent.PAPER_QA.value, docs
+            )
+            if not refined_context.strip():
+                return None
+
+            summary = await map_chain.ainvoke({"query": query, "context": refined_context})
+
+            first_meta = next(iter(sources.values()), {})
+            return {
+                "paper_id": paper_id,
+                "title": first_meta.get("title") or paper_id,
+                "url": first_meta.get("url", ""),
+                "summary": summary,
+            }
+
+        results = await asyncio.gather(
+            *(_answer_for_paper(pid) for pid in paper_ids), return_exceptions=True
+        )
+
+        per_paper: List[Dict[str, Any]] = []
+        for paper_id, res in zip(paper_ids, results):
+            if isinstance(res, Exception):
+                error_logger.error(f"map-reduce PAPER_QA failed for {paper_id}: {res}", exc_info=res)
+                continue
+            if res is not None:
+                per_paper.append(res)
+
+        return {"per_paper_answers": per_paper}
+
+    async def synthesize_comparison(self, state: State) -> Dict[str, Any]:
+        """Reduce step: combines the independently generated per-paper
+        answers into one comparison. Each paper's summary becomes a single
+        citable source ([1], [2], ...), which slots into the same
+        `sources`/`refined_context` shape the standard single-paper path
+        produces — so the existing CitationVerifier/finalize/regeneration-
+        on-failure machinery works unchanged from here on."""
+        self._push_status("synthesize_comparison", "Combining per-paper findings…")
+        per_paper = state.get("per_paper_answers", [])
+
+        sources: Dict[str, Dict[str, Any]] = {}
+        lines: List[str] = []
+        for i, entry in enumerate(per_paper, start=1):
+            label = str(i)
+            sources[label] = {
+                "title": entry.get("title", ""),
+                "url": entry.get("url", ""),
+                "authors": "",
+                "paper_id": entry.get("paper_id", ""),
+                "content": entry.get("summary", ""),
+            }
+            lines.append(f"[{label}] {entry.get('summary', '')}")
+        refined_context = "\n\n".join(lines)
+
+        answer = await self._generator.generate(state["question"], refined_context)
+        return {
+            "sources": sources,
+            "refined_context": refined_context,
+            "generated_answer": answer,
+            "generation_attempts": 1,
+        }
+
     async def no_results(self, state: State) -> Dict[str, Any]:
         self._push_status("no_results", "No relevant papers found…")
         answer = "I couldn't find enough relevant papers to answer this question."
@@ -721,7 +943,7 @@ CONFIDENCE RUBRIC:
 
     async def verify(self, state: State) -> Dict[str, Any]:
         self._push_status("verify", "Checking citations…")
-        verified, notes = self._verifier.verify(state.get("generated_answer", ""), state.get("sources", {}))
+        verified, notes = await self._verifier.verify(state.get("generated_answer", ""), state.get("sources", {}))
         return {"verified": verified, "verification_notes": notes}
 
     async def finalize(self, state: State) -> Dict[str, Any]:

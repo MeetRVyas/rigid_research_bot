@@ -68,6 +68,13 @@ class KeepOrDrop(BaseModel):
     keep: bool = Field(description="True if sentence is directly relevant")
 
 
+class CitationSupport(BaseModel):
+    supported: bool = Field(
+        description="True only if the source text factually supports the claim — topical overlap alone does not count"
+    )
+    reason: str = Field(description="Brief justification for the verdict")
+
+
 class CRAGRequest(BaseModel):
     question: str = Field(description="Original user query", min_length=3, max_length=2000)
     embedding_provider: str = Field(
