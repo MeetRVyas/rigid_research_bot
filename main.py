@@ -94,7 +94,6 @@ if not error_logger.handlers:
 class State(TypedDict):
     question: str
     original_question: str
-    clarification_rounds: int
     chat_history: Annotated[List[Dict[str, str]], operator.add]
     intent: str
     intent_confidence: float
@@ -388,13 +387,16 @@ class CRAG_Service:
         workflow.add_node("finalize", self.finalize)
 
         workflow.add_edge(START, "classify")
-        workflow.add_conditional_edges("classify", self._route_after_classify, {"build_query": "build_query", "clarify": "clarify", "context_reply": "context_reply", "no_results": "no_results"})
-        workflow.add_edge("clarify", "draft_answer")
+        workflow.add_conditional_edges("classify", self._route_after_classify, {"clarify": "clarify", "context_reply": "context_reply", "build_query": "build_query", "draft_answer": "draft_answer", "no_results": "no_results"})
+        workflow.add_edge("clarify", "classify")
+
         workflow.add_edge("draft_answer", "context_hint")
-        workflow.add_conditional_edges("context_hint", self._route_after_context_hint, {"classify": "classify", "finalize_from_draft": "finalize_from_draft"})
+        workflow.add_conditional_edges("context_hint", self._route_after_context_hint, {"finalize_from_draft": "finalize_from_draft", "build_query": "build_query"})
+
         workflow.add_edge("build_query", "retrieve")
         workflow.add_edge("retrieve", "refine")
         workflow.add_conditional_edges("refine", self._route_after_refine, {"generate": "generate", "no_results": "no_results"})
+
         workflow.add_edge("generate", "verify")
         workflow.add_conditional_edges("verify", self._route_after_verify, {"generate": "generate", "finalize": "finalize"})
         
@@ -407,20 +409,29 @@ class CRAG_Service:
 
     def _route_after_classify(self, state: State) -> str:
         intent = state["intent"]
+        
+        # 1. Handle casual chat immediately
         if intent == Intent.GENERAL_CHAT.value: return "context_reply"
-        # A question that decomposed into more than one action is, by
-        # construction, a compound-but-structured request rather than an
-        # ambiguous one — skip the clarify/draft-answer detour for it too.
+
+         # 2. If it's ambiguous, ask the user to clarify FIRST
+        if state.get("ambiguous"):
+            if state["clarification_rounds"] < self.MAX_CLARIFICATION_ROUNDS:
+                return "clarify"
+            else:
+                return "no_results"
+        
+        # 3. If it's clear and specific, go straight to tools
         if intent in BYPASS_INTENTS or len(state.get("actions", [])) > 1: return "build_query"
-        if state["clarification_rounds"] < self.MAX_CLARIFICATION_ROUNDS :
-            return "clarify"
-        return "no_results"
+
+        # 4. If it's clear but OPEN_ENDED, check if the LLM knows it already (CRAG)
+        return "draft_answer"
 
     def _route_after_context_hint(self, state: State) -> str:
         if state.get("context_hint") == "confident_draft" :
             return "finalize_from_draft"
         else :
-            return "classify"
+            # The LLM doesn't know the answer confidently, so we MUST search the database
+            return "build_query"
 
     def _route_after_refine(self, state: State) -> str:
         return "generate" if state.get("refined_context", "").strip() else "no_results"
